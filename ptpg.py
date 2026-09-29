@@ -277,15 +277,12 @@ def pack_rectangles_frontier(
     require_single_hole: bool = True,
     require_boundary_touch: bool = True,
     time_limit: Optional[float] = 60.0,
-    verbose: bool = False,
-    snapshots=None,
-    snapshot_limit=None,
     collect_solutions: Optional[list] = None,
     max_solutions: Optional[int] = None,
 ):
     """PTPG-driven frontier search. Returns (found, placements_or_None,
     nodes_explored). found is True / False / None (feasible / proven
-    infeasible / cut off by time_limit or snapshot_limit).
+    infeasible / cut off by time_limit).
 
     `time_limit` (seconds, wall-clock; None = unbounded) is checked via
     `_check_time` in every hot loop, not just `solve()`, since real work
@@ -334,12 +331,6 @@ def pack_rectangles_frontier(
     # leftover hole `require_single_hole` allows -- see
     # `_fill_pockets_shortcut`. Reset to None whenever that choice is undone.
     hole_geom = [None]
-
-    def log(msg):
-        if verbose:
-            print("  " * len(placements) + msg)
-        if snapshots is not None and (snapshot_limit is None or len(snapshots) < snapshot_limit):
-            snapshots.append((msg, dict(placements)))
 
     def required_adjacency_ok(idx, rx, ry, w, h) -> bool:
         cand = (rx, ry, w, h)
@@ -628,8 +619,6 @@ def pack_rectangles_frontier(
     def solve(free_shape, frontier):
         nodes[0] += 1
         _check_time()
-        if snapshot_limit is not None and snapshots is not None and len(snapshots) >= snapshot_limit:
-            return None
         remaining = remaining_ids()
         if not remaining:
             if require_single_hole:
@@ -660,7 +649,6 @@ def pack_rectangles_frontier(
                 for (rx, ry, w, h, new_free) in cand_opts[cand]:
                     _check_time()
                     placements[cand] = (rx, ry, w, h)
-                    log(f"rect{cand} {sizes[cand]} @ ({rx:g},{ry:g}) [frontier from {originator}]")
                     new_points = order_points([(p, cand) for p in _new_frontier_points(rx, ry, w, h, point, new_free)], new_free)
 
                     # forward-check: did this placement leave a required
@@ -677,7 +665,6 @@ def pack_rectangles_frontier(
                                 break
                     if dead:
                         del placements[cand]
-                        log(f"backtrack rect{cand} [forward-check: unplaceable]")
                         continue
 
                     # triangle shortcut: force in a required partner
@@ -686,8 +673,6 @@ def pack_rectangles_frontier(
                     def resolve_chain(pending_pairs, extra_points, cur_free):
                         if not pending_pairs:
                             for forced_ids, filled_free in _fill_pockets_shortcut(cur_free):
-                                for f_idx in forced_ids:
-                                    log(f"rect{f_idx} {sizes[f_idx]} @ {placements[f_idx][:2]} [pocket fill]")
                                 result = solve(filled_free, extra_points + rest)
                                 if result is True or result is None:
                                     return result
@@ -717,13 +702,11 @@ def pack_rectangles_frontier(
                                     _check_time()
                                     any_option = True
                                     placements[t_idx] = (tx, ty, tw, th)
-                                    log(f"rect{t_idx} {sizes[t_idx]} @ ({tx:g},{ty:g}) [triangle {a}-{b}]")
                                     t_points = order_points([(p, t_idx) for p in _new_frontier_points(tx, ty, tw, th, pt, t_free)], t_free)
                                     result = resolve_chain(rest_pairs, extra_points + t_points, t_free)
                                     if result is True or result is None:
                                         return result
                                     del placements[t_idx]
-                                    log(f"backtrack rect{t_idx}")
                         if not any_option:
                             return False
                         return False
@@ -732,7 +715,6 @@ def pack_rectangles_frontier(
                     if result is True or result is None:
                         return result
                     del placements[cand]
-                    log(f"backtrack rect{cand}")
 
             # every candidate failed here; if `originator` has no other
             # pending point left, this is a verified dead end
@@ -751,16 +733,12 @@ def pack_rectangles_frontier(
                     continue
                 for (rx, ry, uw, uh, new_free) in opts:
                     placements[seed] = (rx, ry, uw, uh)
-                    log(f"rect{seed} {sizes[seed]} @ ({rx:g},{ry:g}) [seed @ {point}]")
                     new_points = order_points([(p, seed) for p in _new_frontier_points(rx, ry, uw, uh, point, new_free)], new_free)
                     for forced_ids, filled_free in _fill_pockets_shortcut(new_free):
-                        for f_idx in forced_ids:
-                            log(f"rect{f_idx} {sizes[f_idx]} @ {placements[f_idx][:2]} [pocket fill]")
                         result = solve(filled_free, new_points)
                         if result is True or result is None:
                             return result
                     del placements[seed]
-                    log(f"backtrack seed rect{seed}")
         return False
 
     try:
@@ -932,7 +910,7 @@ EXAMPLES = {
 def run_example(
     choice: int,
     max_solutions: int = 5,
-    time_limit: Optional[float] = 60.0,
+    time_limit: Optional[float] = 300.0,
     required_adjacency: Optional[Iterable[Tuple[int, int]]] = None,
 ):
     """
