@@ -29,6 +29,7 @@ Passing `collect_solutions` (a list) keeps the search going after each
 valid packing instead of stopping at the first one, returning several
 distinct layouts (deduplicated by geometry).
 """
+import ast
 import time
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -319,6 +320,17 @@ def pack_rectangles_frontier(
         if a not in required_partners[b]:
             required_partners[b].append(a)
 
+    # A rect with exactly 2 required partners who are themselves required
+    # partners of each other (a triangle in the adjacency graph) must sit
+    # at the reflex/convex corner of that pair's L-union -- it has nowhere
+    # else it could go. Sufficient, not necessary, for being a "corner"
+    # rect (plenty of real corners aren't degree-2 triangles), so this is
+    # only used to try these rects earlier in `seed_step`, not as a filter.
+    triangle_corner_ids = {
+        i for i, ps in required_partners.items()
+        if len(ps) == 2 and ps[1] in required_partners.get(ps[0], [])
+    }
+
     placements: Dict[int, Placement] = {}
     nodes = [0]
     deadline = time.perf_counter() + time_limit if time_limit is not None else None
@@ -572,15 +584,19 @@ def pack_rectangles_frontier(
 
     def seed_step(free_shape):
         """Point-first seed selection: fix one anchor point, rank every
-        remaining id placeable there, and exhaust every degree-tied
-        candidate at that point before trying a different point.
+        remaining id placeable there, and exhaust every tied candidate at
+        that point before trying a different point.
 
-        Degree in required_adjacency is the primary rank (corner rooms
-        tend to be lowest-degree); geometric local_score is the
-        tie-break, then largest area first. Among degree-1 candidates, a
-        point that's also one of the plot's own inner-L corners
-        (`inner_l_points`) is preferred, since a degree-1 room tends to
-        sit in a plot's inward notch on real floorplans."""
+        `triangle_corner_ids` is the PRIMARY rank, above degree: a known
+        corner rect has nowhere else to go, so every point/candidate
+        combo involving one is tried, everywhere, before any combo
+        involving a non-corner rect. Degree in required_adjacency is the
+        next rank (corner rooms tend to be lowest-degree); geometric
+        local_score is the tie-break after that, then largest area
+        first. Among degree-1 candidates, a point that's also one of the
+        plot's own inner-L corners (`inner_l_points`) is preferred, since
+        a degree-1 room tends to sit in a plot's inward notch on real
+        floorplans."""
         verts = _polygon_vertices(free_shape)
         anchor_verts = [p for p in verts if boundary.distance(Point(p)) < 1e-9]
         remaining = remaining_ids()
@@ -592,26 +608,30 @@ def pack_rectangles_frontier(
                 opts = placements_of(idx, p, free_shape)
                 if not opts:
                     continue
+                is_corner = 0 if idx in triangle_corner_ids else 1
                 deg = len(required_partners.get(idx, []))
                 w, h = sizes[idx]
-                scored.append((deg, _slot_count(opts, p), -(w * h), idx, opts))
+                scored.append((is_corner, deg, _slot_count(opts, p), -(w * h), idx, opts))
             if not scored:
                 continue
-            scored.sort(key=lambda t: t[:4])
-            # one entry per degree level, so a failed lowest-degree seed
-            # falls back to the next level rather than giving up
-            for level in sorted({d for d, _, _, _, _ in scored}):
-                level_score = min(s for d, s, _, _, _ in scored if d == level)
-                tied = sorted(
-                    ((idx, opts) for d, s, _, idx, opts in scored if (d, s) == (level, level_score)),
-                    key=lambda t: -(sizes[t[0]][0] * sizes[t[0]][1]),
-                )
-                is_inner_l = 0 if (level == 1 and p in inner_l_points) else 1
-                per_point.append((level, is_inner_l, level_score, p, tied))
+            scored.sort(key=lambda t: t[:5])
+            # one entry per (corner, degree) level, so a failed
+            # lowest-degree or non-corner seed falls back to the next
+            # level rather than giving up
+            for is_corner in sorted({c for c, _, _, _, _, _ in scored}):
+                at_corner = [row for row in scored if row[0] == is_corner]
+                for level in sorted({d for _, d, _, _, _, _ in at_corner}):
+                    level_score = min(s for _, d, s, _, _, _ in at_corner if d == level)
+                    tied = sorted(
+                        ((idx, opts) for _, d, s, _, idx, opts in at_corner if (d, s) == (level, level_score)),
+                        key=lambda t: -(sizes[t[0]][0] * sizes[t[0]][1]),
+                    )
+                    is_inner_l = 0 if (level == 1 and p in inner_l_points) else 1
+                    per_point.append((is_corner, level, is_inner_l, level_score, p, tied))
         if not per_point:
             return None
-        per_point.sort(key=lambda t: (t[0], t[1], t[2]))
-        return [(deg, score, p, tied) for (deg, _il, score, p, tied) in per_point]
+        per_point.sort(key=lambda t: (t[0], t[1], t[2], t[3]))
+        return [(deg, score, p, tied) for (_ic, deg, _il, score, p, tied) in per_point]
 
     def remaining_ids():
         return [i for i in sizes if i not in placements]
@@ -910,7 +930,7 @@ EXAMPLES = {
 def run_example(
     choice: int,
     max_solutions: int = 5,
-    time_limit: Optional[float] = 300.0,
+    time_limit: Optional[float] = 60.0,
     required_adjacency: Optional[Iterable[Tuple[int, int]]] = None,
 ):
     """
@@ -925,8 +945,34 @@ def run_example(
     elif required_adjacency is None:
         required_adjacency = example.get("required_adjacency")
 
-    n_adj = len(example.get("required_adjacency") or [])
-    print(f"\nRunning example {choice}: {len(rects)} rects, {n_adj} adjacencies")
+    _solve_and_report(str(choice), polygon, rects, required_adjacency, max_solutions, time_limit)
+
+
+def run_custom_example(max_solutions: int = 5, time_limit: Optional[float] = 60.0):
+    """Prompt the user for their own polygon / rects / required_adjacency
+    and run the same solve-and-report flow as `run_example`. Each value is
+    typed as a plain Python literal and parsed with `ast.literal_eval`."""
+    print("\nEnter your own floorplan. Each value is a Python literal, e.g.:")
+    print("  polygon: [(0,0), (10,0), (10,10), (0,10)]")
+    print("  rects:   {0: (4,4), 1: (6,4), 2: (10,6)}")
+    print("  required_adjacency: [(0,1), (1,2)]   (or [] for none)")
+
+    try:
+        polygon = ast.literal_eval(input("\npolygon: ").strip())
+        rects_raw = ast.literal_eval(input("rects: ").strip())
+        rects = {int(k): tuple(v) for k, v in rects_raw.items()}
+        adj_raw = input("required_adjacency (blank for none): ").strip()
+        required_adjacency = ast.literal_eval(adj_raw) if adj_raw else []
+    except (ValueError, SyntaxError) as exc:
+        print(f"Could not parse that: {exc}")
+        return
+
+    _solve_and_report("custom", polygon, rects, required_adjacency, max_solutions, time_limit)
+
+
+def _solve_and_report(label, polygon, rects, required_adjacency, max_solutions, time_limit):
+    n_adj = len(required_adjacency or [])
+    print(f"\nRunning example {label}: {len(rects)} rects, {n_adj} adjacencies")
     print(f"  polygon: {polygon}")
     print(f"  rects:   {rects}")
     if required_adjacency:
@@ -995,7 +1041,7 @@ def run_example(
         coverage = sum(w * h for _, _, w, h in sol.values()) / poly_area * 100
         print(f"    solution {i}: coverage={coverage:.1f}%  overlaps={overlaps}  outside={outside}  holes={holes}")
 
-    save_path = f"packing_multi_solutions_ex_{choice}.png"
+    save_path = f"packing_multi_solutions_ex_{label}.png"
     render_solution_grid(polygon, solutions, save_path)
     print(f"  saved to {save_path}")
 
@@ -1005,8 +1051,13 @@ def main():
     for key, ex in EXAMPLES.items():
         n_adj = len(ex.get("required_adjacency") or [])
         print(f"  {key}. {len(ex['rects'])} rects, {n_adj} adjacencies")
+    print("  c. enter your own custom example")
 
-    raw = input(f"\nChoose an example [{min(EXAMPLES)}-{max(EXAMPLES)}]: ").strip()
+    raw = input(f"\nChoose an example [{min(EXAMPLES)}-{max(EXAMPLES)}] or 'c': ").strip()
+    if raw.lower() == "c":
+        run_custom_example()
+        return
+
     try:
         choice = int(raw)
         if choice not in EXAMPLES:
