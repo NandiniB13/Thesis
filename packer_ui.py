@@ -9,9 +9,13 @@ Enter the plot, the rooms, the adjacencies and the interior rooms, press Run.
 """
 import argparse
 import json
+import multiprocessing as mp
+import os
 import threading
 import time
+import uuid
 import webbrowser
+from urllib.parse import parse_qs, urlparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -101,6 +105,68 @@ def solve(data):
 
 
 # --------------------------------------------------------------------------
+# background jobs: every Run is its own process, so the page stays usable,
+# several runs can go at once, and any run can be stopped
+# --------------------------------------------------------------------------
+
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+MAX_RUNNING = max(2, os.cpu_count() or 2)
+
+
+def _worker(data, conn):
+    try:
+        conn.send(solve(data))
+    except Exception as ex:
+        conn.send({"status": "invalid", "errors": [f"{type(ex).__name__}: {ex}"]})
+    finally:
+        conn.close()
+
+
+def start_job(data):
+    with JOBS_LOCK:
+        running = sum(1 for j in JOBS.values() if j["result"] is None and not j["stopped"]
+                      and j["proc"].is_alive())
+        if running >= MAX_RUNNING:
+            return {"errors": [f"{running} runs are already going. Stop one or wait for it to finish."]}
+        parent, child = mp.Pipe(False)
+        proc = mp.Process(target=_worker, args=(data, child), daemon=True)
+        proc.start()
+        child.close()
+        jid = uuid.uuid4().hex[:10]
+        JOBS[jid] = {"proc": proc, "conn": parent, "t0": time.time(), "result": None, "stopped": False}
+        return {"job": jid}
+
+
+def job_status(jid):
+    with JOBS_LOCK:
+        j = JOBS.get(jid)
+        if not j:
+            return {"state": "gone"}
+        if j["result"] is None and not j["stopped"]:
+            try:
+                if j["conn"].poll():
+                    j["result"] = j["conn"].recv()
+                elif not j["proc"].is_alive():
+                    j["result"] = {"status": "invalid", "errors": ["The search process ended unexpectedly."]}
+            except (EOFError, OSError):
+                j["result"] = {"status": "invalid", "errors": ["The search process ended unexpectedly."]}
+        if j["result"] is not None:
+            return {"state": "done", "result": j["result"]}
+        secs = round(time.time() - j["t0"], 1)
+        return {"state": "stopped" if j["stopped"] else "running", "seconds": secs}
+
+
+def stop_job(jid):
+    with JOBS_LOCK:
+        j = JOBS.get(jid)
+        if j and j["result"] is None and not j["stopped"]:
+            j["stopped"] = True
+            j["proc"].terminate()
+    return {"ok": True}
+
+
+# --------------------------------------------------------------------------
 # HTTP
 # --------------------------------------------------------------------------
 
@@ -117,7 +183,10 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        if self.path == "/":
+        if self.path.startswith("/status"):
+            q = parse_qs(urlparse(self.path).query)
+            self._send(200, json.dumps(job_status((q.get("job") or [""])[0])))
+        elif self.path == "/":
             self._send(200, PAGE, "text/html")
         elif self.path == "/examples":
             ex = {}
@@ -142,6 +211,14 @@ class Handler(BaseHTTPRequestHandler):
                 adj = {tuple(sorted((int(a), int(b)))) for a, b in data["adjacency"]}
                 e, w, i = validate(poly, rects, adj, {int(x) for x in data.get("interior", [])})
                 self._send(200, json.dumps({"errors": e, "warnings": w, "info": i}))
+            elif self.path == "/start":
+                poly = [tuple(map(float, p)) for p in data["polygon"]]
+                rects = {int(k): (float(v[0]), float(v[1])) for k, v in data["rects"].items()}
+                adj = {tuple(sorted((int(a), int(b)))) for a, b in data["adjacency"]}
+                e, w, i = validate(poly, rects, adj, {int(x) for x in data.get("interior", [])})
+                self._send(200, json.dumps({"errors": e} if e else start_job(data)))
+            elif self.path == "/stop":
+                self._send(200, json.dumps(stop_job(data.get("job", ""))))
             elif self.path == "/solve":
                 self._send(200, json.dumps(solve(data)))
             else:
@@ -155,7 +232,7 @@ PAGE = r"""<!doctype html>
 <title>Room packer</title>
 <style>
 :root{--bg:#f6f5f1;--card:#fff;--ink:#1d2327;--mut:#6b7279;--line:#dedbd2;--acc:#1f6f6b;--acc2:#e9f3f2;--bad:#b3261e;--badbg:#fbeceb;--ok:#1b6e3a;--okbg:#e7f4ec;--warn:#8a5a00;--warnbg:#fdf3dc;--int:#f4c06a;--room:#cfe3f4}
-@media (prefers-color-scheme:dark){:root{--bg:#171a1c;--card:#1f2326;--ink:#e8e6e1;--mut:#9aa1a6;--line:#343a3e;--acc:#5fb8b2;--acc2:#1d3231;--bad:#f2a29c;--badbg:#3a2220;--ok:#8fd3a8;--okbg:#1c3025;--warn:#e8c06a;--warnbg:#352c14;--int:#8a6a22;--room:#2c4a63}}
+#@media (prefers-color-scheme:dark){:root{--bg:#171a1c;--card:#1f2326;--ink:#e8e6e1;--mut:#9aa1a6;--line:#343a3e;--acc:#5fb8b2;--acc2:#1d3231;--bad:#f2a29c;--badbg:#3a2220;--ok:#8fd3a8;--okbg:#1c3025;--warn:#e8c06a;--warnbg:#352c14;--int:#8a6a22;--room:#2c4a63}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}
 header{padding:18px 24px 6px}h1{margin:0;font-size:20px}header p{margin:2px 0 0;color:var(--mut)}
@@ -184,7 +261,8 @@ td input[type=number]{width:62px}
 .mut{color:var(--mut);font-size:13px}.stats{display:flex;gap:16px;flex-wrap:wrap;margin:6px 0 10px}.stats b{font-size:18px;display:block}
 svg{width:100%;height:auto;background:var(--bg);border-radius:8px;border:1px solid var(--line)}
 details summary{cursor:pointer;color:var(--mut);font-size:13px}.opts label{display:flex;margin:4px 0;font-size:13px}
-.sticky{position:sticky;top:12px}
+.sticky{position:sticky;top:12px;max-height:calc(100vh - 24px);overflow:auto}
+.run{border-top:1px solid var(--line);padding-top:8px;margin-top:8px}.run:first-child{border-top:none;margin-top:0;padding-top:0}.run h3{margin:0 0 4px;font-size:14px;display:flex;justify-content:space-between;align-items:center;gap:8px}
 </style></head><body>
 <header><h1>Room packer</h1><p>Enter a plot, rooms, and which rooms must touch. Press Run.</p></header>
 <main>
@@ -221,9 +299,21 @@ details summary{cursor:pointer;color:var(--mut);font-size:13px}.opts label{displ
  </section>
 </div>
 <div class="sticky">
- <section><h2>Result</h2><div id="result" class="mut">Nothing run yet. The layout will appear here.</div></section>
+ <section><h2>Graph <span class="mut">rooms and who must touch</span></h2>
+  <svg id="graphsvg" viewBox="-170 -170 340 340" style="max-height:340px"></svg>
+  <div class="mut" id="graphNote"></div></section>
+ <section><h2>Result</h2>
+  <div id="runs"><div class="mut">Nothing run yet.</div></div></section>
 </div>
 </main>
+<div id="lock" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:50;align-items:center;justify-content:center">
+ <div style="background:var(--card);color:var(--ink);padding:28px 36px;border-radius:14px;text-align:center;min-width:300px">
+  <div style="font-size:18px;font-weight:600">Searching…</div>
+  <div style="font-size:34px;margin:8px 0" id="lockTime">0.0 s</div>
+  <div class="mut" id="lockLimit" style="margin-bottom:14px"></div>
+  <button id="lockStop" style="padding:9px 26px;font-weight:600">Stop</button>
+ </div>
+</div>
 <script>
 const $=id=>document.getElementById(id);
 let rooms=[{w:5,h:5,i:false},{w:5,h:5,i:false},{w:5,h:5,i:false},{w:5,h:5,i:false}];
@@ -258,12 +348,12 @@ function drawPlot(){
 }
 function renderRooms(){
  const n=rooms.length;
- $("rooms").querySelector("thead").innerHTML="<tr><th></th><th>#</th><th>Width</th><th>Height</th><th title='must not touch the plot boundary, not even at a point'>Interior</th><th style='border-left:2px solid var(--line)'></th>"+rooms.map((r,j)=>`<th class="cj" data-j="${j}" style="text-align:center">${j}<br><small class="mut">${r.w}×${r.h}</small></th>`).join("")+"</tr>";
+ $("rooms").querySelector("thead").innerHTML="<tr><th></th><th>#</th><th title='optional label shown on the drawing'>Name</th><th>Width</th><th>Height</th><th title='must not touch the plot boundary, not even at a point'>Interior</th><th style='border-left:2px solid var(--line)'></th>"+rooms.map((r,j)=>`<th class="cj" data-j="${j}" style="text-align:center">${j}<br><small class="mut nmh">${(r.n||"").slice(0,8)}</small><br><small class="mut szh">${r.w}×${r.h}</small></th>`).join("")+"</tr>";
  const tb=$("rooms").querySelector("tbody");tb.innerHTML="";
  rooms.forEach((r,i)=>{const tr=document.createElement("tr");
   let ticks="";for(let j=0;j<n;j++)ticks+=j===i?`<td style="background:var(--bg)"></td>`:`<td style="text-align:center"><input type="checkbox" data-a="${i}" data-b="${j}" ${adj.has(key(i,j))?"checked":""}></td>`;
-  tr.innerHTML=`<td><button class="x" title="remove room ${i}">✕</button></td><td><b>${i}</b></td><td><input type="number" min="0" step="any" value="${r.w}"></td><td><input type="number" min="0" step="any" value="${r.h}"></td><td><input type="checkbox" class="int" ${r.i?"checked":""}></td><td style="border-left:2px solid var(--line)"></td>${ticks}`;
-  const [w,h]=tr.querySelectorAll("input[type=number]"),c=tr.querySelector("input.int");
+  tr.innerHTML=`<td><button class="x" title="remove room ${i}">✕</button></td><td><b>${i}</b></td><td><input type="text" class="nm" style="width:110px" placeholder="optional"></td><td><input type="number" min="0" step="any" value="${r.w}"></td><td><input type="number" min="0" step="any" value="${r.h}"></td><td><input type="checkbox" class="int" ${r.i?"checked":""}></td><td style="border-left:2px solid var(--line)"></td>${ticks}`;
+  const [w,h]=tr.querySelectorAll("input[type=number]"),c=tr.querySelector("input.int"),nm=tr.querySelector("input.nm");nm.value=r.n||"";nm.oninput=()=>{r.n=nm.value;heads()};
   w.oninput=()=>{r.w=+w.value;changed();heads()};h.oninput=()=>{r.h=+h.value;changed();heads()};c.onchange=()=>{r.i=c.checked;changed()};
   tr.querySelector(".x").onclick=()=>{removeRoom(i)};
   tr.querySelectorAll("input[data-a]").forEach(t=>t.onchange=()=>{const k=key(+t.dataset.a,+t.dataset.b);t.checked?adj.add(k):adj.delete(k);syncTicks();changed()});
@@ -271,21 +361,48 @@ function renderRooms(){
  const t=rooms.reduce((s,r)=>s+r.w*r.h,0);$("roomArea").textContent=n+" rooms · area "+(+t.toFixed(4));
  refreshTouches();
 }
-function heads(){document.querySelectorAll("th.cj").forEach(h=>{h.querySelector("small").textContent=rooms[+h.dataset.j].w+"×"+rooms[+h.dataset.j].h})}
+function heads(){document.querySelectorAll("th.cj").forEach(h=>{const r=rooms[+h.dataset.j];h.querySelector(".szh").textContent=r.w+"×"+r.h;h.querySelector(".nmh").textContent=(r.n||"").slice(0,8);h.title=r.n||""})}
 function syncTicks(){document.querySelectorAll("input[data-a]").forEach(t=>{t.checked=adj.has(key(+t.dataset.a,+t.dataset.b))});refreshTouches()}
 function removeRoom(k){
- rooms.splice(k,1);const n=new Set();
+ rooms.splice(k,1);gpos={};const n=new Set();
  adj.forEach(e=>{let[a,b]=e.split("-").map(Number);if(a===k||b===k)return;if(a>k)a--;if(b>k)b--;n.add(key(a,b))});adj=n;renderRooms();changed()}
 function refreshTouches(){}
+let gpos={};
+function layoutGraph(){
+ const n=rooms.length,E=[...adj].map(e=>e.split("-").map(Number)).filter(([a,b])=>a<n&&b<n);
+ for(const k of Object.keys(gpos))if(+k>=n)delete gpos[k];
+ for(let i=0;i<n;i++)if(!gpos[i]){const a=2*Math.PI*i/Math.max(n,1);gpos[i]=[110*Math.cos(a)+(Math.random()-.5),110*Math.sin(a)+(Math.random()-.5)]}
+ if(n<2)return E;
+ const k=Math.sqrt(280*280/n)*.6;let T=22;
+ for(let it=0;it<90;it++){
+  const d=Array.from({length:n},()=>[0,0]);
+  for(let i=0;i<n;i++)for(let j=i+1;j<n;j++){let dx=gpos[i][0]-gpos[j][0],dy=gpos[i][1]-gpos[j][1],l=Math.hypot(dx,dy)||.01,f=k*k/l;dx/=l;dy/=l;d[i][0]+=dx*f;d[i][1]+=dy*f;d[j][0]-=dx*f;d[j][1]-=dy*f}
+  for(const[a,b]of E){let dx=gpos[a][0]-gpos[b][0],dy=gpos[a][1]-gpos[b][1],l=Math.hypot(dx,dy)||.01,f=l*l/k;dx/=l;dy/=l;d[a][0]-=dx*f;d[a][1]-=dy*f;d[b][0]+=dx*f;d[b][1]+=dy*f}
+  for(let i=0;i<n;i++){const l=Math.hypot(d[i][0],d[i][1])||.01,m=Math.min(l,T);gpos[i][0]+=d[i][0]/l*m;gpos[i][1]+=d[i][1]/l*m;gpos[i][0]=Math.max(-150,Math.min(150,gpos[i][0]));gpos[i][1]=Math.max(-150,Math.min(150,gpos[i][1]))}
+  T*=.95;
+ }
+ return E;
+}
+function drawGraph(){
+ const n=rooms.length,E=layoutGraph(),deg=Array(n).fill(0);E.forEach(([a,b])=>{deg[a]++;deg[b]++});
+ let g="";
+ E.forEach(([a,b])=>g+=`<line x1="${gpos[a][0]}" y1="${gpos[a][1]}" x2="${gpos[b][0]}" y2="${gpos[b][1]}" stroke="var(--mut)" stroke-width="2"/>`);
+ rooms.forEach((r,i)=>{const[x,y]=gpos[i],iso=n>1&&deg[i]===0;
+  g+=`<circle cx="${x}" cy="${y}" r="15" fill="${r.i?"var(--int)":"var(--room)"}" stroke="${iso?"var(--bad)":"var(--ink)"}" stroke-width="${iso?3:1.5}"/><text x="${x}" y="${y}" font-size="15" font-weight="700" text-anchor="middle" dominant-baseline="central" fill="var(--ink)">${i}</text>`;
+  if(r.n&&r.n.trim())g+=`<text x="${x}" y="${y+27}" font-size="13" text-anchor="middle" fill="var(--ink)">${esc(r.n.trim().slice(0,10))}</text>`});
+ $("graphsvg").innerHTML=g;
+ const iso=deg.map((d,i)=>d===0?i:-1).filter(i=>i>=0);
+ $("graphNote").textContent=n+" rooms, "+E.length+" required pairs. Orange = interior room."+(n>1&&iso.length?" Not connected yet: room(s) "+iso.join(", ")+" have no neighbour.":"");
+}
 function payload(){
- const rs={};rooms.forEach((r,i)=>rs[i]=[r.w,r.h]);
- return {polygon:polygon(),rects:rs,adjacency:[...adj].map(e=>e.split("-").map(Number)),
+ const rs={},lb={};rooms.forEach((r,i)=>{rs[i]=[r.w,r.h];if(r.n&&r.n.trim())lb[i]=r.n.trim()});
+ return {polygon:polygon(),rects:rs,labels:lb,adjacency:[...adj].map(e=>e.split("-").map(Number)),
   interior:rooms.map((r,i)=>r.i?i:-1).filter(i=>i>=0),time_limit:+$("tl").value,
   options:{}}
 }
 function changed(){
  const t=rooms.reduce((s,r)=>s+r.w*r.h,0);$("roomArea").textContent=rooms.length+" rooms · area "+(+t.toFixed(4));
- drawPlot();clearTimeout(timer);timer=setTimeout(check,250)}
+ drawPlot();drawGraph();clearTimeout(timer);timer=setTimeout(check,250)}
 async function check(){
  let r;try{r=await (await fetch("/validate",{method:"POST",body:JSON.stringify(payload())})).json()}catch(e){return}
  let h="";(r.errors||[]).forEach(e=>h+=`<div class="msg bad">${esc(e)}</div>`);
@@ -293,31 +410,76 @@ async function check(){
   h+=`<div class="msg ok">Input looks valid.${i.hole_area?` Rooms leave an interior hole of area ${+i.hole_area.toFixed(4)}.`:" The rooms fill the plot exactly."}</div>`}
  $("problems").innerHTML=h;$("run").dataset.bad=(r.errors||[]).length?1:"";
 }
-function drawResult(res,poly){
+function drawResult(res,p,uid){
+ const poly=p.polygon;
  const xs=poly.map(q=>q[0]),ys=poly.map(q=>q[1]);const mx=Math.min(...xs),Mx=Math.max(...xs),my=Math.min(...ys),My=Math.max(...ys);
  const pad=Math.max(Mx-mx,My-my)*.04;const s=Math.max(Mx-mx,My-my)/22;
  let g=`<svg viewBox="${mx-pad} ${-(My+pad)} ${Mx-mx+2*pad} ${My-my+2*pad}">`;
  g+=`<polygon points="${poly.map(q=>q[0]+","+(-q[1])).join(" ")}" fill="none" stroke="var(--ink)" stroke-width="${s/4}"/>`;
- (res.hole||[]).forEach(h=>g+=`<polygon points="${h.map(q=>q[0]+","+(-q[1])).join(" ")}" fill="url(#hatch)" stroke="var(--mut)" stroke-dasharray="${s/2}" stroke-width="${s/8}"/>`);
- const inter=new Set(payload().interior);
+ (res.hole||[]).forEach(h=>g+=`<polygon points="${h.map(q=>q[0]+","+(-q[1])).join(" ")}" fill="url(#hatch${uid})" stroke="var(--mut)" stroke-dasharray="${s/2}" stroke-width="${s/8}"/>`);
+ const pl=p,inter=new Set(pl.interior);
  for(const[i,[x,y,w,h]]of Object.entries(res.placements)){
   g+=`<rect x="${x}" y="${-(y+h)}" width="${w}" height="${h}" fill="${inter.has(+i)?"var(--int)":"var(--room)"}" stroke="var(--ink)" stroke-width="${s/8}"/>`+
-     `<text x="${x+w/2}" y="${-(y+h/2)}" font-size="${Math.min(s*1.3,Math.min(w,h)*.6)}" text-anchor="middle" dominant-baseline="central" fill="var(--ink)" font-weight="600">${i}</text>`}
- return g.replace("<svg ",`<svg `)+`<defs><pattern id="hatch" width="${s}" height="${s}" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="${s}" stroke="var(--mut)" stroke-width="${s/10}"/></pattern></defs></svg>`;
+     `<text x="${x+w/2}" y="${-(y+h/2)}" font-size="${Math.min(s*1.3,Math.min(w,h)*.6,w*1.7/Math.max(1,String(pl.labels[i]||i).length*.6*1.7))}" text-anchor="middle" dominant-baseline="central" fill="var(--ink)" font-weight="600">${esc(pl.labels[i]||i)}</text>`}
+ return g.replace("<svg ",`<svg `)+`<defs><pattern id="hatch${uid}" width="${s}" height="${s}" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="${s}" stroke="var(--mut)" stroke-width="${s/10}"/></pattern></defs></svg>`;
 }
-$("run").onclick=async()=>{
- const b=$("run");if(b.dataset.bad){$("result").innerHTML='<div class="msg bad">Fix the problems listed under “Run” first.</div>';return}
- b.disabled=true;$("runStat").textContent="searching… (up to "+$("tl").value+" s)";const p=payload();
- let res;try{res=await (await fetch("/solve",{method:"POST",body:JSON.stringify(p)})).json()}catch(e){res={status:"invalid",errors:[String(e)]}}
- b.disabled=false;$("runStat").textContent="";const R=$("result");
- if(res.status==="invalid"){R.innerHTML=res.errors.map(e=>`<div class="msg bad">${esc(e)}</div>`).join("");return}
+let runs=[],runSeq=0,poller=null,lockT=null;
+function lockUI(r){
+ document.querySelector("main").inert=true;$("lock").style.display="flex";
+ $("lockLimit").textContent="Time limit "+r.p.time_limit+" s. Everything else is locked until it finishes or you stop it.";
+ const t0=Date.now();clearInterval(lockT);lockT=setInterval(()=>{$("lockTime").textContent=((Date.now()-t0)/1000).toFixed(1)+" s"},100);
+ $("lockStop").onclick=async()=>{$("lockStop").disabled=true;await fetch("/stop",{method:"POST",body:JSON.stringify({job:r.job})});r.state="stopped";unlockUI();renderOne(r)};
+ $("lockStop").disabled=false;
+}
+function unlockUI(){clearInterval(lockT);$("lock").style.display="none";document.querySelector("main").inert=false}
+function resultHtml(r){
+ const res=r.res,p=r.p;
+ if(res.status==="invalid")return res.errors.map(e=>`<div class="msg bad">${esc(e)}</div>`).join("");
  const stats=`<div class="stats"><div><b>${res.seconds}s</b>time</div><div><b>${res.nodes}</b>search nodes</div></div>`;
  if(res.status==="solved"){const v=res.verify;
-  R.innerHTML=`<div class="msg ok"><b>Layout found.</b> Checked: ${v.overlaps} overlaps, ${v.outside} outside the plot, ${v.holes} extra holes.</div>`+stats+drawResult(res,p.polygon)+
+  return `<div class="msg ok"><b>Layout found.</b> Checked: ${v.overlaps} overlaps, ${v.outside} outside the plot, ${v.holes} extra holes.</div>`+stats+drawResult(res,p,r.n)+
    `<div class="mut" style="margin-top:6px">Blue = ordinary room, orange = interior room, hatched = hole.</div>`}
- else if(res.status==="none")
-  R.innerHTML=`<div class="msg warn"><b>No layout found.</b> The search finished without one. This is very likely infeasible, but a “no” is not a proof: the corner rules and pruning are heuristics.</div>`+stats
- else R.innerHTML=`<div class="msg warn"><b>Timed out</b> after ${res.seconds}s. Undecided. Try a longer time limit.</div>`+stats;
+ if(res.status==="none")
+  return `<div class="msg warn"><b>No layout found.</b> The search finished without one. This is very likely infeasible, but a “no” is not a proof: the corner rules and pruning are heuristics.</div>`+stats;
+ return `<div class="msg warn"><b>Timed out</b> after ${res.seconds}s. Undecided. Try a longer time limit.</div>`+stats;
+}
+function runHtml(r){
+ const rooms_n=Object.keys(r.p.rects).length;let body,head;
+ if(r.state==="running"){head="running";body=`<div class="mut">Searching…</div>`}
+ else if(r.state==="stopped"){head="stopped";body=`<div class="msg warn">Stopped before it finished.</div>`}
+ else{head="";body=resultHtml(r)}
+ return `<h3><span>${rooms_n} rooms</span><span>${head}</span></h3>${body}`;
+}
+function renderRuns(){
+ const box=$("runs");
+ if(!runs.length){box.innerHTML='<div class="mut">Nothing run yet.</div>';return}
+ box.innerHTML=runs.map(r=>`<div class="run" id="run${r.n}">${runHtml(r)}</div>`).join("");
+ const running=runs.filter(r=>r.state==="running").length;$("runStat").textContent=running?running+" running":"";
+}
+function renderOne(r){const d=$("run"+r.n);if(d)d.innerHTML=runHtml(r);const running=runs.filter(x=>x.state==="running").length;$("runStat").textContent=running?running+" running":""}
+async function poll(){
+ const live=runs.filter(r=>r.state==="running");
+ if(!live.length){clearInterval(poller);poller=null;return}
+ for(const r of live){
+  let st;try{st=await (await fetch("/status?job="+r.job)).json()}catch(e){continue}
+  if(st.state==="done"){r.state="done";r.res=st.result;unlockUI();renderOne(r)}
+  else if(st.state==="stopped"){r.state="stopped";unlockUI();renderOne(r)}
+  else if(st.state==="gone"){r.state="done";r.res={status:"invalid",errors:["The server no longer knows this run (it was restarted)."]};unlockUI();renderOne(r)}
+  else{r.secs=Math.floor(st.seconds);const e=$("el"+r.n);if(e)e.textContent=r.secs}
+ }
+}
+$("run").onclick=async()=>{
+ if($("run").dataset.bad){$("runStat").textContent="Fix the problems listed above first.";return}
+ const p=payload();let r;
+ try{r=await (await fetch("/start",{method:"POST",body:JSON.stringify(p)})).json()}catch(e){r={errors:[String(e)]}}
+ if(r.errors){$("runStat").textContent=r.errors[0];return}
+ const nr={n:++runSeq,job:r.job,p:p,state:"running",secs:0};runs=[nr];renderRuns();lockUI(nr);
+ if(!poller)poller=setInterval(poll,700);
+};
+$("runs").onclick=async e=>{
+ const st=e.target.dataset.stop,del=e.target.dataset.del;
+ if(st){await fetch("/stop",{method:"POST",body:JSON.stringify({job:st})});const r=runs.find(x=>x.job===st);if(r){r.state="stopped";renderOne(r)}}
+ 
 };
 // plot controls
 ["W","H","nw","nh","nc","corners"].forEach(id=>$(id).addEventListener("input",changed));
@@ -328,8 +490,8 @@ $("qadd").onclick=()=>{for(let k=0;k<+$("qn").value;k++)rooms.push({w:+$("qw").v
 function setState(d){
  mode="C";$("tabC").onclick();$("corners").value=d.polygon.map(q=>q.join(",")).join("\n");
  const n=Math.max(...Object.keys(d.rects).map(Number))+1;
- rooms=[];for(let i=0;i<n;i++){const r=d.rects[i]||[1,1];rooms.push({w:r[0],h:r[1],i:(d.interior||[]).includes(i)})}
- adj=new Set(d.adjacency.map(([a,b])=>key(a,b)));renderRooms();changed()}
+ rooms=[];for(let i=0;i<n;i++){const r=d.rects[i]||[1,1];rooms.push({w:r[0],h:r[1],i:(d.interior||[]).includes(i),n:(d.labels||{})[i]||""})}
+ adj=new Set(d.adjacency.map(([a,b])=>key(a,b)));gpos={};renderRooms();changed()}
 $("save").onclick=()=>{const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([JSON.stringify(payload(),null,1)],{type:"application/json"}));a.download="packer_example.json";a.click()};
 $("load").onclick=()=>$("file").click();
 $("file").onchange=async e=>{const f=e.target.files[0];if(f)setState(JSON.parse(await f.text()))};

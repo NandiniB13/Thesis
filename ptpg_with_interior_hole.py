@@ -427,7 +427,7 @@ def pack_rectangles_frontier(
     *,
     require_boundary_touch: bool = True,
     interior_ids: Iterable[int] = (),
-    time_limit: Optional[float] = 300.0,
+    time_limit: Optional[float] = 60.0,
     collect_solutions: Optional[list] = None,
     max_solutions: Optional[int] = None,
     single_hole: bool = True,
@@ -1216,8 +1216,13 @@ def verify_placements(polygon, placements) -> Tuple[int, int, int]:
 # Rendering
 # --------------------------------------------------------------------------
 
-def render_solution_grid(polygon, solutions, save_path, cols=5):
-    """Saves a grid with one panel per solution (a dict of placements)."""
+def render_solution_grid(polygon, solutions, save_path, cols=5, labels=None):
+    """Saves a grid with one panel per solution (a dict of placements).
+
+    `labels` (optional) maps room id -> text drawn on that room, e.g.
+    {0: "Living", 1: "Kitchen"}. A room without a label shows its number.
+    The room size is printed under the label."""
+    labels = labels or {}
     import math
     import matplotlib.pyplot as plt
     import matplotlib.patches as patches
@@ -1241,10 +1246,11 @@ def render_solution_grid(polygon, solutions, save_path, cols=5):
     for i, placements in enumerate(solutions):
         ax = axes[i]
         ax.plot(bx, by, "k-", linewidth=1.5)
-        for x, y, w, h in placements.values():
+        for idx, (x, y, w, h) in placements.items():
             ax.add_patch(patches.Rectangle((x, y), w, h, linewidth=0.8, edgecolor="black",
                                             facecolor="tab:blue", alpha=0.65))
-            ax.text(x + w / 2, y + h / 2, f"{w:g}x{h:g}", ha="center", va="center", fontsize=6)
+            ax.text(x + w / 2, y + h / 2, f"{labels.get(idx, idx)}\n{w:g}x{h:g}",
+                    ha="center", va="center", fontsize=6)
         ax.set_xlim(*xlim)
         ax.set_ylim(*ylim)
         ax.set_aspect("equal")
@@ -1265,6 +1271,8 @@ def render_solution_grid(polygon, solutions, save_path, cols=5):
 # Example plots
 # --------------------------------------------------------------------------
 
+# Each example may also carry an optional  labels={0: "Living", 1: "Kitchen", ...}
+# (room id -> name). Labelled rooms are drawn with that name; others with their number.
 EXAMPLES = {
     1: dict(
         polygon=[(0, 0), (25, 0), (25, 15), (15, 15), (15, 30), (0, 30)],
@@ -1353,7 +1361,7 @@ EXAMPLES = {
 def run_example(
     choice: int,
     max_solutions: int = 5,
-    time_limit: Optional[float] = 300.0,
+    time_limit: Optional[float] = 60.0,
     required_adjacency: Optional[Iterable[Tuple[int, int]]] = None,
 ):
     """
@@ -1369,10 +1377,10 @@ def run_example(
         required_adjacency = example.get("required_adjacency")
 
     _solve_and_report(str(choice), polygon, rects, required_adjacency, max_solutions, time_limit,
-                      interior_ids=example.get("interior", ()))
+                      interior_ids=example.get("interior", ()), labels=example.get("labels"))
 
 
-def run_custom_example(max_solutions: int = 5, time_limit: Optional[float] = 300.0):
+def run_custom_example(max_solutions: int = 5, time_limit: Optional[float] = 60.0):
     """Prompt the user for their own polygon / rects / required_adjacency
     and run the same solve-and-report flow as `run_example`. Each value is
     typed as a plain Python literal and parsed with `ast.literal_eval`."""
@@ -1381,6 +1389,7 @@ def run_custom_example(max_solutions: int = 5, time_limit: Optional[float] = 300
     print("  rects:   {0: (4,4), 1: (6,4), 2: (10,6)}")
     print("  required_adjacency: [(0,1), (1,2)]   (or [] for none)")
     print("  interior rects (must not touch the boundary): [2]   (or [] for none)")
+    print("  labels (optional): {0: 'Living', 1: 'Kitchen'}   (blank = show room numbers)")
 
     try:
         polygon = ast.literal_eval(input("\npolygon: ").strip())
@@ -1390,15 +1399,17 @@ def run_custom_example(max_solutions: int = 5, time_limit: Optional[float] = 300
         required_adjacency = ast.literal_eval(adj_raw) if adj_raw else []
         interior_raw = input("interior rects (blank for none): ").strip()
         interior_ids = ast.literal_eval(interior_raw) if interior_raw else []
+        labels_raw = input("labels (blank for numbers): ").strip()
+        labels = {int(k): str(v) for k, v in ast.literal_eval(labels_raw).items()} if labels_raw else None
     except (ValueError, SyntaxError) as exc:
         print(f"Could not parse that: {exc}")
         return
 
     _solve_and_report("custom", polygon, rects, required_adjacency, max_solutions, time_limit,
-                      interior_ids=interior_ids)
+                      interior_ids=interior_ids, labels=labels)
 
 
-def _solve_and_report(label, polygon, rects, required_adjacency, max_solutions, time_limit, interior_ids=()):
+def _solve_and_report(label, polygon, rects, required_adjacency, max_solutions, time_limit, interior_ids=(), labels=None):
     n_adj = len(required_adjacency or [])
     print(f"\nRunning example {label}: {len(rects)} rects, {n_adj} adjacencies")
     print(f"  polygon: {polygon}")
@@ -1481,7 +1492,7 @@ def _solve_and_report(label, polygon, rects, required_adjacency, max_solutions, 
         print(f"    solution {i}: coverage={coverage:.1f}%  overlaps={overlaps}  outside={outside}  holes={holes}")
 
     save_path = f"packing_multi_solutions_ex_{label}.png"
-    render_solution_grid(polygon, solutions, save_path)
+    render_solution_grid(polygon, solutions, save_path, labels=labels)
     print(f"  saved to {save_path}")
 
 
