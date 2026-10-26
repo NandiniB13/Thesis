@@ -314,7 +314,41 @@ def _layout_key(placements: Dict[int, Placement]) -> tuple:
     ))
 
 
-def _pack_mrv_corner_ptpg(
+def _point_in_poly_fast(px: float, py: float, poly_pts: List[Tuple[float, float]]) -> bool:
+    """Fast pure-Python ray-casting point-in-polygon check for grid cell centers."""
+    inside = False
+    n = len(poly_pts)
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly_pts[i]
+        xj, yj = poly_pts[j]
+        if (yi > py) != (yj > py) and (px < (xj - xi) * (py - yi) / (yj - yi + 1e-15) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def _normalize_adjacency_pairs(required_adjacency) -> List[Tuple[int, int]]:
+    """Normalize user-supplied adjacency input so a single pair like `(0, 1)` or
+    a list of pairs `[(0, 1), (2, 3)]` or set `{(0, 1)}` all work seamlessly."""
+    if not required_adjacency:
+        return []
+    if (
+        isinstance(required_adjacency, (tuple, list))
+        and len(required_adjacency) == 2
+        and all(isinstance(x, (int, float)) for x in required_adjacency)
+    ):
+        return [(int(required_adjacency[0]), int(required_adjacency[1]))]
+    out = []
+    for item in required_adjacency:
+        if isinstance(item, (tuple, list)) and len(item) == 2:
+            out.append((int(item[0]), int(item[1])))
+        else:
+            raise ValueError(f"Invalid adjacency pair: {item!r}")
+    return out
+
+
+def _pack_mrv_corner_ptpg_single(
     polygon,
     rects,
     required_adjacency=None,
@@ -325,12 +359,16 @@ def _pack_mrv_corner_ptpg(
     collect_solutions=None,
     max_solutions=None,
     allow_corner_adj: bool = False,
+    strict_exact_graph: bool = False,
+    pure_mrv: bool = False,
+    max_nodes: Optional[int] = None,
+    seed_quadrant: Optional[Tuple[int, int]] = None,
+    use_wall_len: bool = False,
 ):
     sizes = dict(rects)
     if not check_area_match(polygon, sizes)[0]:
         return False, collect_solutions, 0
 
-    poly = Polygon(polygon)
     horiz_segs, vert_segs = _boundary_segments(polygon)
     convex_vertices = _polygon_convex_vertices(polygon)
     interior = set(interior_ids or ())
@@ -338,28 +376,30 @@ def _pack_mrv_corner_ptpg(
     if unknown:
         raise ValueError(f"interior_ids references unknown rect ids: {sorted(unknown)}")
 
-    enforce_adj = bool(required_adjacency)
+    adj_pairs = _normalize_adjacency_pairs(required_adjacency)
+    enforce_adj = bool(adj_pairs)
     required_partners = {i: set() for i in sizes}
-    if required_adjacency:
-        for a, b in required_adjacency:
-            if a == b:
-                raise ValueError(f"required_adjacency has a self-pair: ({a!r}, {a!r})")
-            if a not in sizes or b not in sizes:
-                raise ValueError(f"required_adjacency references an unknown rect id ({a!r}, {b!r})")
-            required_partners[a].add(b)
-            required_partners[b].add(a)
+    for a, b in adj_pairs:
+        if a == b:
+            raise ValueError(f"required_adjacency has a self-pair: ({a!r}, {a!r})")
+        if a not in sizes or b not in sizes:
+            raise ValueError(f"required_adjacency references an unknown rect id ({a!r}, {b!r})")
+        required_partners[a].add(b)
+        required_partners[b].add(a)
 
-    # Topological invariant: any non-interior room with exactly 2 required partners
-    # that touch each other must sit on a 90-degree convex corner of the plot.
+    # Topological invariant: ONLY when solving a full exact maximal PTPG (`strict_exact_graph=True`),
+    # a non-interior room with degree 2 whose two partners touch each other must sit in a 90-degree plot corner.
     triangle_corner_ids = set()
-    if enforce_adj and require_boundary_touch and not allow_corner_adj:
+    if enforce_adj and strict_exact_graph and require_boundary_touch and not allow_corner_adj:
         for i, ps in required_partners.items():
             if i not in interior and len(ps) == 2:
                 p0, p1 = tuple(ps)
                 if p1 in required_partners[p0]:
                     triangle_corner_ids.add(i)
 
-    minx, miny, maxx, maxy = poly.bounds
+    xs_p = [p[0] for p in polygon]
+    ys_p = [p[1] for p in polygon]
+    minx, miny, maxx, maxy = min(xs_p), min(ys_p), max(xs_p), max(ys_p)
     ox, oy = int(round(minx)), int(round(miny))
     W, H = int(round(maxx - minx)), int(round(maxy - miny))
 
@@ -367,21 +407,142 @@ def _pack_mrv_corner_ptpg(
     is_bnd_cell = [[False] * W for _ in range(H)]
     total_bnd_cells = 0
     for y in range(H):
+        cy = oy + y + 0.5
         for x in range(W):
-            pt = box(ox + x, oy + y, ox + x + 1, oy + y + 1)
-            if poly.intersection(pt).area < 0.999:
+            cx = ox + x + 0.5
+            if not _point_in_poly_fast(cx, cy, polygon):
                 grid[y][x] = 2
             else:
-                if _shares_boundary_edge_fast(ox + x, oy + y, 1, 1, horiz_segs, vert_segs):
+                on_b = (
+                    x == 0 or x == W - 1 or y == 0 or y == H - 1
+                    or not _point_in_poly_fast(cx - 1.0, cy, polygon)
+                    or not _point_in_poly_fast(cx + 1.0, cy, polygon)
+                    or not _point_in_poly_fast(cx, cy - 1.0, polygon)
+                    or not _point_in_poly_fast(cx, cy + 1.0, polygon)
+                )
+                if on_b:
                     is_bnd_cell[y][x] = True
                     total_bnd_cells += 1
+
+    bnd_psum = [[0] * (W + 1) for _ in range(H + 1)]
+    for y in range(H):
+         b_row = is_bnd_cell[y]
+         p_row = bnd_psum[y + 1]
+         prev_row = bnd_psum[y]
+         r_sum = 0
+         for x in range(W):
+             if b_row[x]:
+                 r_sum += 1
+             p_row[x + 1] = prev_row[x + 1] + r_sum
+
+    int_sizes = {rid: (int(round(w0)), int(round(h0))) for rid, (w0, h0) in sizes.items()}
+    max_bnd_for_rid = {}
+    for rid, (w0, h0) in sizes.items():
+        if rid in interior:
+            max_bnd_for_rid[rid] = 0
+        else:
+            iw, ih = int(round(w0)), int(round(h0))
+            max_bnd_for_rid[rid] = iw * ih if min(iw, ih) == 1 else min(iw * ih, 2 * (iw + ih) - 4)
+
+    # Group rooms by geometric equivalence class `(min(w,h), max(w,h), is_interior)`
+    # so duplicate-size rooms (e.g. two 4x7 rooms #4 and #5) can be cleanly relabeled
+    # to satisfy partial adjacency constraints without symmetry-breaking collisions!
+    iso_classes = {}
+    rid_to_iso = {}
+    for rid, (w0, h0) in sizes.items():
+        ikey = (int(round(min(w0, h0))), int(round(max(w0, h0))), rid in interior)
+        iso_classes.setdefault(ikey, []).append(rid)
+        rid_to_iso[rid] = ikey
+
+    has_isomorphic_dups = any(len(v) > 1 for v in iso_classes.values())
+    use_iso_class_search = enforce_adj and (not strict_exact_graph) and has_isomorphic_dups and len(adj_pairs) <= 8
+
+    def try_relabel_solution(raw_placements):
+        if not enforce_adj:
+            return dict(raw_placements)
+        touch_fn = _rects_touch_or_corner if allow_corner_adj else _rects_touch
+
+        def check_map(cand_p):
+            for a, b in adj_pairs:
+                if not touch_fn(cand_p[a], cand_p[b]):
+                    return False
+            if strict_exact_graph:
+                rids = list(cand_p.keys())
+                for idx_a in range(len(rids)):
+                    ra = rids[idx_a]
+                    for idx_b in range(idx_a + 1, len(rids)):
+                        rb = rids[idx_b]
+                        if rb not in required_partners[ra] and _rects_touch(cand_p[ra], cand_p[rb]):
+                            return False
+            return True
+
+        if check_map(raw_placements):
+            return dict(raw_placements)
+        if not has_isomorphic_dups:
+            return None
+
+        constrained_rids = [r for r, ps in required_partners.items() if ps]
+        involved_classes = sorted({rid_to_iso[r] for r in constrained_rids})
+        work = dict(raw_placements)
+
+        def assign_class(c_idx):
+            if c_idx == len(involved_classes):
+                return dict(work) if check_map(work) else None
+            ikey = involved_classes[c_idx]
+            members = iso_classes[ikey]
+            boxes = [raw_placements[m] for m in members]
+            c_members = [m for m in members if required_partners[m]]
+            u_members = [m for m in members if not required_partners[m]]
+            used_b = [False] * len(boxes)
+
+            def assign_member(m_idx):
+                if m_idx == len(c_members):
+                    rem_boxes = [boxes[bi] for bi in range(len(boxes)) if not used_b[bi]]
+                    for um, bx in zip(u_members, rem_boxes):
+                        work[um] = bx
+                    return assign_class(c_idx + 1)
+                m_id = c_members[m_idx]
+                for bi, bx in enumerate(boxes):
+                    if used_b[bi]:
+                        continue
+                    ok = True
+                    for p_id in required_partners[m_id]:
+                        p_ikey = rid_to_iso[p_id]
+                        p_idx = involved_classes.index(p_ikey)
+                        if p_idx < c_idx or (p_idx == c_idx and p_id in c_members[:m_idx]):
+                            if not touch_fn(bx, work[p_id]):
+                                ok = False
+                                break
+                    if not ok:
+                        continue
+                    used_b[bi] = True
+                    work[m_id] = bx
+                    res = assign_member(m_idx + 1)
+                    if res is not None:
+                        return res
+                    used_b[bi] = False
+                return None
+
+            return assign_member(0)
+
+        return assign_class(0)
 
     placements = {}
     used = set()
     nodes = [0]
     deadline = time.perf_counter() + time_limit if time_limit is not None else None
-    initial_sol_count = len(collect_solutions) if collect_solutions is not None else 0
     seen_layouts = {_layout_key(s) for s in collect_solutions} if collect_solutions else set()
+
+    def touches_exterior_wall(gx, gy, uw, uh):
+        if gx == 0 or gy == 0 or gx + uw == W or gy + uh == H:
+            return True
+        for dx in range(uw):
+            if grid[gy - 1][gx + dx] == 2 or grid[gy + uh][gx + dx] == 2:
+                return True
+        for dy in range(uh):
+            if grid[gy + dy][gx - 1] == 2 or grid[gy + dy][gx + uw] == 2:
+                return True
+        return False
 
     def can_place(rid, gx, gy, uw, uh, is_int):
         if gx < 0 or gy < 0 or gx + uw > W or gy + uh > H:
@@ -391,40 +552,69 @@ def _pack_mrv_corner_ptpg(
             for dx in range(uw):
                 if row[gx + dx] != 0:
                     return False
-        rx, ry = float(ox + gx), float(oy + gy)
-        if rid in triangle_corner_ids and not _at_plot_corner(rx, ry, uw, uh, convex_vertices):
-            return False
-        tb = _shares_boundary_edge_fast(rx, ry, uw, uh, horiz_segs, vert_segs)
+        tb = (bnd_psum[gy + uh][gx + uw] - bnd_psum[gy][gx + uw] - bnd_psum[gy + uh][gx] + bnd_psum[gy][gx]) > 0
         if is_int:
             if tb:
                 return False
         elif require_boundary_touch and not tb:
             return False
+        rx, ry = float(ox + gx), float(oy + gy)
+        if rid in triangle_corner_ids and not _at_plot_corner(rx, ry, uw, uh, convex_vertices):
+            return False
         if enforce_adj:
             cand = (rx, ry, float(uw), float(uh))
             partners = required_partners[rid]
-            for j, placed_box in placements.items():
-                if j in partners:
-                    ok_touch = _rects_touch_or_corner(cand, placed_box) if allow_corner_adj else _rects_touch(cand, placed_box)
-                    if not ok_touch:
-                        return False
-                else:
-                    if _rects_touch(cand, placed_box):
-                        return False
-            # Also check that every ALREADY-PLACED room `j` that STILL needs to touch
-            # some unplaced room (AFTER placing `rid`) has not been completely walled off!
+            if use_iso_class_search:
+                rid_class_members = iso_classes[rid_to_iso[rid]]
+                unplaced_same_class = [m for m in rid_class_members if m not in used and m != rid]
+                if not unplaced_same_class:
+                    for j, placed_box in placements.items():
+                        if j in partners:
+                            j_members = iso_classes[rid_to_iso[j]]
+                            if not any(m not in used for m in j_members):
+                                ok_touch = _rects_touch_or_corner(cand, placed_box) if allow_corner_adj else _rects_touch(cand, placed_box)
+                                if not ok_touch:
+                                    return False
+            else:
+                for j, placed_box in placements.items():
+                    if j in partners:
+                        ok_touch = _rects_touch_or_corner(cand, placed_box) if allow_corner_adj else _rects_touch(cand, placed_box)
+                        if not ok_touch:
+                            return False
+                    elif strict_exact_graph:
+                        if _rects_touch(cand, placed_box):
+                            return False
         return True
 
+    def can_unplaced_fit_adjacent_to(pgx, pgy, puw, puh, q_id):
+        qw0, qh0 = sizes[q_id]
+        qw_i, qh_i = int(round(qw0)), int(round(qh0))
+        q_int = q_id in interior
+        for uw, uh in ((qw_i, qh_i), (qh_i, qw_i)) if qw_i != qh_i else ((qw_i, qh_i),):
+            for gx in (pgx - uw, pgx + puw):
+                if gx < 0 or gx + uw > W:
+                    continue
+                y_start = max(0, pgy - uh + (0 if allow_corner_adj else 1))
+                y_end = min(H - uh, pgy + puh - (0 if allow_corner_adj else 1))
+                for gy in range(y_start, y_end + 1):
+                    if can_place(q_id, gx, gy, uw, uh, q_int):
+                        return True
+            for gy in (pgy - uh, pgy + puh):
+                if gy < 0 or gy + uh > H:
+                    continue
+                x_start = max(0, pgx - uw + (0 if allow_corner_adj else 1))
+                x_end = min(W - uw, pgx + puw - (0 if allow_corner_adj else 1))
+                for gx in range(x_start, x_end + 1):
+                    if can_place(q_id, gx, gy, uw, uh, q_int):
+                        return True
+        return False
+
     def mark(gx, gy, uw, uh, val):
-        bnd_delta = 0
         for dy in range(uh):
             row = grid[gy + dy]
-            b_row = is_bnd_cell[gy + dy]
             for dx in range(uw):
                 row[gx + dx] = val
-                if b_row[gx + dx]:
-                    bnd_delta += 1
-        return bnd_delta
+        return bnd_psum[gy + uh][gx + uw] - bnd_psum[gy][gx + uw] - bnd_psum[gy + uh][gx] + bnd_psum[gy][gx]
 
     rx_grid = [[0] * W for _ in range(H)]
     ry_grid = [[0] * W for _ in range(H)]
@@ -473,6 +663,7 @@ def _pack_mrv_corner_ptpg(
                     x += 1
 
         narrow_cells = 0
+        max_ry_for_rx = [0] * (W + 1)
         for x in range(W):
             y = 0
             while y < H:
@@ -490,6 +681,8 @@ def _pack_mrv_corner_ptpg(
                     for yy in range(y0, y):
                         ry_grid[yy][x] = run
                         rx_val = rx_grid[yy][x]
+                        if run > max_ry_for_rx[rx_val]:
+                            max_ry_for_rx[rx_val] = run
                         if rx_val == 1 or run == 1:
                             narrow_cells += 1
                             if narrow_cells > narrow_area_cap:
@@ -508,25 +701,73 @@ def _pack_mrv_corner_ptpg(
                     ry_grid[y][x] = 0
                     y += 1
 
-        # If enforce_adj is True, check that any placed room with unplaced required partners
-        # still has at least one free cell adjacent to its boundary, and check span viability!
+        for w_idx in range(W - 1, 0, -1):
+            if max_ry_for_rx[w_idx + 1] > max_ry_for_rx[w_idx]:
+                max_ry_for_rx[w_idx] = max_ry_for_rx[w_idx + 1]
+
+        has_int_rem = any(is_int for (_wm, _hm, is_int, _r) in rem_types)
+        if has_int_rem:
+            max_iry_for_irx = [0] * (W + 1)
+            for x in range(W):
+                y = 0
+                while y < H:
+                    if grid[y][x] == 0 and not is_bnd_cell[y][x]:
+                        y0 = y
+                        max_irx = int_rx_grid[y][x]
+                        y += 1
+                        while y < H and grid[y][x] == 0 and not is_bnd_cell[y][x]:
+                            if int_rx_grid[y][x] > max_irx:
+                                max_irx = int_rx_grid[y][x]
+                            y += 1
+                        iry = y - y0
+                        if iry > max_iry_for_irx[max_irx]:
+                            max_iry_for_irx[max_irx] = iry
+                    else:
+                        y += 1
+            for w_idx in range(W - 1, 0, -1):
+                if max_iry_for_irx[w_idx + 1] > max_iry_for_irx[w_idx]:
+                    max_iry_for_irx[w_idx] = max_iry_for_irx[w_idx + 1]
+
+        for (w_min, h_max, is_int, _rid) in rem_types:
+            if is_int:
+                ok_fit = (w_min <= W and max_iry_for_irx[w_min] >= h_max) or (h_max <= W and max_iry_for_irx[h_max] >= w_min)
+            else:
+                ok_fit = (w_min <= W and max_ry_for_rx[w_min] >= h_max) or (h_max <= W and max_ry_for_rx[h_max] >= w_min)
+            if not ok_fit:
+                return False
+
+
+
         if enforce_adj:
-            for q_id, (qw, qh) in sizes.items():
-                if q_id in used:
+            for p_id, (px, py, pw, ph) in placements.items():
+                if use_iso_class_search and any(m not in used for m in iso_classes[rid_to_iso[p_id]]):
                     continue
-                placed_ps = [placements[p] for p in required_partners[q_id] if p in placements]
-                if len(placed_ps) >= 2:
-                    ok_span = False
-                    for uw, uh in ((qw, qh), (qh, qw)) if qw != qh else ((qw, qh),):
-                        rx_min = max(px - uw for px, py, pw, ph in placed_ps)
-                        rx_max = min(px + pw for px, py, pw, ph in placed_ps)
-                        ry_min = max(py - uh for px, py, pw, ph in placed_ps)
-                        ry_max = min(py + ph for px, py, pw, ph in placed_ps)
-                        if rx_min <= rx_max + 1e-6 and ry_min <= ry_max + 1e-6:
-                            ok_span = True
-                            break
-                    if not ok_span:
-                        return False
+                pgx, pgy = int(round(px - ox)), int(round(py - oy))
+                puw, puh = int(round(pw)), int(round(ph))
+                for q_id in required_partners[p_id]:
+                    if q_id not in used:
+                        if use_iso_class_search and any(m in used for m in iso_classes[rid_to_iso[q_id]]):
+                            continue
+                        if not can_unplaced_fit_adjacent_to(pgx, pgy, puw, puh, q_id):
+                            return False
+
+            if not use_iso_class_search:
+                for q_id, (qw, qh) in sizes.items():
+                    if q_id in used:
+                        continue
+                    placed_ps = [placements[p] for p in required_partners[q_id] if p in placements]
+                    if len(placed_ps) >= 2:
+                        ok_span = False
+                        for uw, uh in ((qw, qh), (qh, qw)) if qw != qh else ((qw, qh),):
+                            rx_min = max(px - uw for px, py, pw, ph in placed_ps)
+                            rx_max = min(px + pw for px, py, pw, ph in placed_ps)
+                            ry_min = max(py - uh for px, py, pw, ph in placed_ps)
+                            ry_max = min(py + ph for px, py, pw, ph in placed_ps)
+                            if rx_min <= rx_max + 1e-6 and ry_min <= ry_max + 1e-6:
+                                ok_span = True
+                                break
+                        if not ok_span:
+                            return False
         return True
 
     def find_convex_corners():
@@ -551,23 +792,31 @@ def _pack_mrv_corner_ptpg(
         return corners
 
     total_rem_bnd_area = sum(w * h for rid, (w, h) in sizes.items() if rid not in interior)
+    total_rem_max_bnd_cap = sum(max_bnd_for_rid.values())
 
-    def backtrack(uncov_bnd_cells, rem_bnd_area):
+    def backtrack(uncov_bnd_cells, rem_bnd_area, rem_max_bnd_cap):
         nodes[0] += 1
+        if max_nodes is not None and nodes[0] > max_nodes:
+            raise _SearchTimeout()
         if deadline and time.perf_counter() > deadline:
             raise _SearchTimeout()
         if len(used) == len(sizes):
+            relabeled = try_relabel_solution(placements)
+            if relabeled is None:
+                return False
             if collect_solutions is not None:
-                k = _layout_key(placements)
+                k = _layout_key(relabeled)
                 if k not in seen_layouts:
                     seen_layouts.add(k)
-                    collect_solutions.append(dict(placements))
+                    collect_solutions.append(relabeled)
                     if max_solutions and len(collect_solutions) >= max_solutions:
                         return True
                 return False
+            placements.clear()
+            placements.update(relabeled)
             return True
 
-        if require_boundary_touch and rem_bnd_area < uncov_bnd_cells:
+        if require_boundary_touch and (rem_bnd_area < uncov_bnd_cells or rem_max_bnd_cap < uncov_bnd_cells):
             return False
 
         rem_types = []
@@ -576,19 +825,22 @@ def _pack_mrv_corner_ptpg(
         min_bnd_side = 10**9
         narrow_area_cap = 0
 
-        for rid, (w0, h0) in sizes.items():
+        for rid, (w0, h0) in int_sizes.items():
             if rid in used:
                 continue
-            s_min, s_max = min(w0, h0), max(w0, h0)
+            s_min, s_max = (w0, h0) if w0 <= h0 else (h0, w0)
             if s_min < min_side:
                 min_side = s_min
             if s_min == 1:
-                narrow_area_cap += int(round(w0 * h0))
+                narrow_area_cap += w0 * h0
             is_int = rid in interior
             if not is_int and s_min < min_bnd_side:
                 min_bnd_side = s_min
-            # When enforce_adj is True, only deduplicate rooms if they have the exact same required_partners set!
-            t_key = (s_min, s_max, is_int, frozenset(required_partners[rid]) if enforce_adj else None)
+            t_key = (
+                (s_min, s_max, is_int)
+                if (not enforce_adj or use_iso_class_search)
+                else (s_min, s_max, is_int, frozenset(required_partners[rid]))
+            )
             if t_key not in seen_type_keys:
                 seen_type_keys.add(t_key)
                 rem_types.append((s_min, s_max, is_int, rid))
@@ -600,25 +852,43 @@ def _pack_mrv_corner_ptpg(
         if not corners:
             return False
 
+        active_front_rids = set()
+        if enforce_adj and not strict_exact_graph and not use_iso_class_search:
+            for p_id in placements:
+                for q_id in required_partners[p_id]:
+                    if q_id not in used:
+                        active_front_rids.add(q_id)
+
         best_corner_opts = None
-        best_key = (10**9, 10**9, 10**9, 10**9)
+        best_key = (10**9, 10**9, 10**9, 10**9, 10**9, 10**9)
 
         for (cx, cy, dir_x, dir_y) in corners:
             rx_len = 0
+            wall_x_len = 0
             xx = cx
+            wy = cy - dir_y
             while 0 <= xx < W and grid[cy][xx] == 0:
                 rx_len += 1
+                if use_wall_len and (wy < 0 or wy >= H or grid[wy][xx] != 0) and wall_x_len == rx_len - 1:
+                    wall_x_len += 1
                 xx += dir_x
             ry_len = 0
+            wall_y_len = 0
             yy = cy
+            wx = cx - dir_x
             while 0 <= yy < H and grid[yy][cx] == 0:
                 ry_len += 1
+                if use_wall_len and (wx < 0 or wx >= W or grid[yy][wx] != 0) and wall_y_len == ry_len - 1:
+                    wall_y_len += 1
                 yy += dir_y
 
             opts = []
+            has_pending_partner = False
             for (w_min, h_max, is_int, rid) in rem_types:
+                is_front = rid in active_front_rids
+                is_seeded_room = (not placements) and bool(required_partners[rid]) and (not use_iso_class_search)
                 for uw, uh in ((w_min, h_max), (h_max, w_min)) if w_min != h_max else ((w_min, h_max),):
-                    uw_i, uh_i = int(round(uw)), int(round(uh))
+                    uw_i, uh_i = uw, uh
                     if uw_i > rx_len or uh_i > ry_len:
                         continue
                     rem_x = rx_len - uw_i
@@ -634,25 +904,32 @@ def _pack_mrv_corner_ptpg(
                     gx = cx if dir_x == 1 else (cx + 1 - uw_i)
                     gy = cy if dir_y == 1 else (cy + 1 - uh_i)
                     if can_place(rid, gx, gy, uw_i, uh_i, is_int):
-                        flush_score = (1 if uw_i == rx_len else 0) + (1 if uh_i == ry_len else 0)
-                        opts.append((-flush_score, 1 if is_int else 0, -(uw_i * uh_i), rid, gx, gy, uw_i, uh_i, is_int))
+                        if is_front:
+                            has_pending_partner = True
+                        flush_score = (1 if (uw_i == rx_len or (use_wall_len and uw_i == wall_x_len)) else 0) + (1 if (uh_i == ry_len or (use_wall_len and uh_i == wall_y_len)) else 0)
+                        seed_boost = 1 if (is_front or is_seeded_room) else 0
+                        opts.append((-seed_boost, -flush_score, 1 if is_int else 0, -(uw_i * uh_i), rid, gx, gy, uw_i, uh_i, is_int))
             if not opts:
                 return False
-            flush_cnt = sum(1 for o in opts if o[0] < 0)
-            eff_len = flush_cnt if (0 < flush_cnt <= 2 and min(rx_len, ry_len) <= 10) else len(opts)
-            ckey = (eff_len, len(opts), min(rx_len, ry_len), rx_len + ry_len)
+            flush_cnt = sum(1 for o in opts if o[1] < 0)
+            eff_len = len(opts) if pure_mrv else (flush_cnt if (0 < flush_cnt <= 2 and min(rx_len, ry_len) <= 10) else len(opts))
+            q_tie = 0
+            if not placements and seed_quadrant is not None:
+                q_tie = -(cx * seed_quadrant[0] + cy * seed_quadrant[1])
+            ckey = (0 if has_pending_partner else 1, q_tie, eff_len, len(opts), min(wall_x_len, wall_y_len) if use_wall_len else min(rx_len, ry_len), (wall_x_len + wall_y_len) if use_wall_len else (rx_len + ry_len))
             if ckey < best_key:
                 best_key = ckey
                 best_corner_opts = opts
 
         best_corner_opts.sort()
-        for _fl, _int_flag, _neg_area, rid, gx, gy, uw_i, uh_i, is_int in best_corner_opts:
+        for _sb, _fl, _int_flag, _neg_area, rid, gx, gy, uw_i, uh_i, is_int in best_corner_opts:
             bnd_cov = mark(gx, gy, uw_i, uh_i, 1)
             used.add(rid)
             placements[rid] = (float(ox + gx), float(oy + gy), float(uw_i), float(uh_i))
             res = backtrack(
                 uncov_bnd_cells - bnd_cov,
-                rem_bnd_area - (0 if is_int else uw_i * uh_i)
+                rem_bnd_area - (0 if is_int else uw_i * uh_i),
+                rem_max_bnd_cap - max_bnd_for_rid[rid],
             )
             if res is True or res is None:
                 return res
@@ -662,28 +939,94 @@ def _pack_mrv_corner_ptpg(
         return False
 
     try:
-        res = backtrack(total_bnd_cells, total_rem_bnd_area)
+        res = backtrack(total_bnd_cells, total_rem_bnd_area, total_rem_max_bnd_cap)
     except _SearchTimeout:
         res = None
-
-    # If strict 1D-wall adjacency found no solutions (e.g., because the user's
-    # required_adjacency list includes 0D corner-point touches like (7,11) or (12,14)
-    # at a 4-room cross joint), automatically retry with allow_corner_adj=True!
-    if enforce_adj and not allow_corner_adj and res is False and (collect_solutions is None or len(collect_solutions) == initial_sol_count):
-        return _pack_mrv_corner_ptpg(
-            polygon, rects, required_adjacency,
-            require_boundary_touch=require_boundary_touch,
-            interior_ids=interior_ids,
-            time_limit=time_limit,
-            collect_solutions=collect_solutions,
-            max_solutions=max_solutions,
-            allow_corner_adj=True,
-        )
 
     if collect_solutions is not None:
         return res, collect_solutions, nodes[0]
     return (True, dict(placements), nodes[0]) if res is True else ((False, None, nodes[0]) if res is False else (None, None, nodes[0]))
 
+
+def _pack_mrv_corner_ptpg(
+    polygon,
+    rects,
+    required_adjacency=None,
+    *,
+    require_boundary_touch=True,
+    interior_ids=(),
+    time_limit=60.0,
+    collect_solutions=None,
+    max_solutions=None,
+    allow_corner_adj: bool = False,
+):
+    adj_pairs = _normalize_adjacency_pairs(required_adjacency)
+    enforce_adj = bool(adj_pairs)
+    total_nodes = 0
+    t0 = time.perf_counter()
+
+    def rem_time():
+        return None if time_limit is None else max(0.05, time_limit - (time.perf_counter() - t0))
+
+    # Build a portfolio of search passes:
+    # - If a full PTPG graph is provided (`len(adj_pairs) >= len(rects)`), try `strict_exact_graph=True`
+    #   first (solves full PTPGs in ~15-150 nodes), then automatically fall back to mandatory-contact mode
+    #   (`strict_exact_graph=False`) so extra incidental touches never cause false infeasibility.
+    # - Try both arm-cap flush ordering (`pure_mrv=False`) and pure MRV ordering (`pure_mrv=True`) with
+    #   directional seed tie-breakers so asymmetric single-pair constraints in any wing are found rapidly.
+    passes = []
+    if enforce_adj and len(adj_pairs) >= len(rects):
+        passes.append((True, False, False, 15000, None, False))
+        passes.append((True, True, False, 15000, None, False))
+
+    passes.append((False, False, allow_corner_adj, 3000, None, False))
+    for qd in ((1, -1), (-1, -1), (-1, 1), (1, 1)):
+        passes.append((False, False, allow_corner_adj, 1800, qd, False))
+    passes.append((False, True, allow_corner_adj, 2500, None, False))
+    passes.append((False, False, allow_corner_adj, 150000, None, False))
+
+    if enforce_adj and not allow_corner_adj:
+        if len(adj_pairs) >= len(rects):
+            passes.append((True, False, True, 15000, None, False))
+        passes.append((False, False, True, 25000, None, False))
+        passes.append((False, True, True, 25000, None, False))
+
+    for strict_g, pmrv, corner_adj, n_Wait, q_dir, w_len in passes:
+        rt = rem_time()
+        if rt is not None and rt <= 0.05:
+            break
+        initial_cnt = len(collect_solutions) if collect_solutions is not None else 0
+        res, out, nodes = _pack_mrv_corner_ptpg_single(
+            polygon,
+            rects,
+            adj_pairs,
+            require_boundary_touch=require_boundary_touch,
+            interior_ids=interior_ids,
+            time_limit=rt,
+            collect_solutions=collect_solutions,
+            max_solutions=max_solutions,
+            allow_corner_adj=corner_adj,
+            strict_exact_graph=strict_g,
+            pure_mrv=pmrv,
+            max_nodes=n_Wait,
+            seed_quadrant=q_dir,
+            use_wall_len=w_len,
+        )
+        total_nodes += nodes
+        if collect_solutions is not None:
+            if len(collect_solutions) > initial_cnt and (max_solutions is None or len(collect_solutions) >= max_solutions):
+                return res, collect_solutions, total_nodes
+            if res is False and n_Wait >= 100000 and not strict_g and len(collect_solutions) > 0:
+                return False, collect_solutions, total_nodes
+        else:
+            if res is True:
+                return True, out, total_nodes
+            if res is False and not enforce_adj and pmrv:
+                return False, None, total_nodes
+
+    if collect_solutions is not None:
+        return (True if collect_solutions else False), collect_solutions, total_nodes
+    return False, None, total_nodes
 
 
 def pack_rectangles_frontier(
@@ -710,13 +1053,14 @@ def pack_rectangles_frontier(
     unknown = interior - set(sizes)
     if unknown:
         raise ValueError(f"interior_ids references unknown rect ids: {sorted(unknown)}")
+    adj_pairs = _normalize_adjacency_pairs(required_adjacency)
     is_int_grid = (
         all(abs(x - round(x)) < 1e-6 and abs(y - round(y)) < 1e-6 for x, y in polygon)
         and all(abs(w - round(w)) < 1e-6 and abs(h - round(h)) < 1e-6 for w, h in sizes.values())
     )
     if is_int_grid:
         return _pack_mrv_corner_ptpg(
-            polygon, sizes, required_adjacency,
+            polygon, sizes, adj_pairs,
             require_boundary_touch=require_boundary_touch,
             interior_ids=interior,
             time_limit=time_limit,
@@ -727,7 +1071,7 @@ def pack_rectangles_frontier(
     seen_layouts = {_layout_key(sol) for sol in collect_solutions} if collect_solutions else set()
 
     required_partners: Dict[int, List[int]] = {i: [] for i in sizes}
-    for a, b in required_adjacency:
+    for a, b in adj_pairs:
         if a == b:
             raise ValueError(f"required_adjacency has a self-pair: ({a!r}, {a!r})")
         if a not in sizes or b not in sizes:
@@ -737,10 +1081,15 @@ def pack_rectangles_frontier(
         if a not in required_partners[b]:
             required_partners[b].append(a)
 
-    triangle_corner_ids = {
-        i for i, ps in required_partners.items()
-        if i not in interior and len(ps) == 2 and ps[1] in required_partners.get(ps[0], [])
-    }
+    strict_exact = len(adj_pairs) >= len(sizes)
+    triangle_corner_ids = (
+        {
+            i for i, ps in required_partners.items()
+            if i not in interior and len(ps) == 2 and ps[1] in required_partners.get(ps[0], [])
+        }
+        if strict_exact
+        else set()
+    )
 
     placements: Dict[int, Placement] = {}
     nodes = [0]
@@ -754,7 +1103,9 @@ def pack_rectangles_frontier(
         cand = (rx, ry, w, h)
         partners = required_partners[idx]
         for j, placed in placements.items():
-            if _rects_touch(cand, placed) != (j in partners):
+            if j in partners and not _rects_touch(cand, placed):
+                return False
+            if strict_exact and j not in partners and _rects_touch(cand, placed):
                 return False
         return True
 
@@ -1391,9 +1742,12 @@ EXAMPLES = {
     23: {'polygon': [(0, 7), (0, 13), (20, 13), (20, 0), (13, 0), (13, 7)], 'rects': {0: (7, 4), 1: (7, 3), 2: (2, 3), 3: (4, 4), 4: (2, 3), 5: (2, 2), 6: (2, 5), 7: (2, 2), 8: (2, 4), 9: (4, 5), 10: (3, 4), 11: (3, 4), 12: (11, 1), 13: (3, 3), 14: (1, 2)}, 'required_adjacency': [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7), (7, 8), (8, 9), (7, 9), (9, 10), (10, 11), (12, 7), (12, 9), (12, 6), (12, 5), (12, 4), (12, 3), (12, 10), (12, 11), (12, 13), (13, 3), (13, 0), (13, 11), (13, 14), (14, 3), (14, 2), (14, 0)], 'interior': [12, 13, 14], 'name': 'L-Shape (Original Ex 8: 15 rooms, 3 interior)'},
     24: {'polygon': [(0, 0), (21, 0), (21, 6), (9, 6), (9, 18), (0, 18)], 'rects': {0: (6, 8), 1: (6, 4), 2: (2, 2), 3: (3, 2), 4: (4, 5), 5: (2, 5), 6: (3, 5), 7: (2, 5), 8: (3, 3), 9: (4, 9), 10: (6, 3), 11: (4, 8), 12: (2, 1)}, 'required_adjacency': [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7), (7, 8), (8, 9), (10, 7), (10, 8), (10, 9), (10, 11), (11, 1), (11, 3), (11, 4), (11, 5), (11, 6), (11, 7), (11, 12), (12, 1), (12, 2), (12, 3)], 'interior': [12], 'name': 'L-Shape (Original Ex 9: 13 rooms, 1 interior)'},
     25: {'polygon': [(0, 0), (18, 0), (18, 13), (10, 13), (10, 24), (0, 24)], 'rects': {0: (9, 6), 1: (4, 4), 2: (4, 4), 3: (6, 4), 4: (4, 4), 5: (5, 6), 6: (3, 4), 7: (2, 4), 8: (4, 4), 9: (3, 4), 10: (5, 5), 11: (7, 7), 12: (5, 3), 13: (2, 7), 14: (7, 2), 15: (1, 3), 16: (5, 2), 17: (2, 5)}, 'required_adjacency': [(0, 1), (0, 2), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (5, 7), (6, 7), (7, 8), (8, 9), (9, 10), (10, 11), (11, 12), (13, 3), (13, 4), (13, 5), (13, 8), (13, 9), (13, 10), (13, 15), (14, 0), (14, 2), (14, 3), (14, 10), (14, 11), (14, 15), (14, 16), (15, 3), (15, 10), (16, 0), (16, 11), (16, 12), (16, 17), (17, 0), (17, 12)], 'interior': [13, 14, 15, 16], 'name': 'L-Shape (Original Ex 10: 18 rooms, 4 interior)'},
+    26: {'name': 'Staggered Multi-Scale T-Shape (20 rooms: 13 exterior, 7 diverse interior)', 'polygon': [(7, 0), (21, 0), (21, 13), (29, 13), (29, 25), (0, 25), (0, 13), (7, 13)], 'rects': {0: (7, 7), 1: (3, 7), 2: (4, 9), 3: (5, 6), 4: (4, 7), 5: (4, 7), 6: (8, 3), 7: (5, 5), 8: (9, 4), 9: (5, 5), 10: (4, 3), 11: (6, 9), 12: (8, 3), 13: (5, 2), 14: (2, 7), 15: (3, 7), 16: (1, 4), 17: (9, 5), 18: (5, 4), 19: (4, 6)}, 'required_adjacency': [(0, 1), (0, 3), (0, 13), (1, 2), (1, 13), (2, 4), (2, 13), (3, 6), (3, 13), (3, 14), (4, 12), (4, 15), (4, 18), (4, 19), (5, 6), (5, 7), (5, 16), (6, 14), (6, 16), (6, 17), (7, 8), (7, 16), (7, 17), (8, 9), (8, 17), (9, 10), (9, 17), (9, 18), (9, 19), (10, 11), (10, 19), (11, 12), (11, 19), (12, 19), (13, 14), (13, 15), (14, 15), (14, 17), (15, 18), (16, 17), (17, 18), (18, 19)], 'interior': [13, 14, 15, 16, 17, 18, 19]},
+    27: {'name': 'Staggered Multi-Scale T-Shape (22 rooms: 13 exterior, 9 diverse interior)', 'polygon': [(7, 0), (21, 0), (21, 13), (29, 13), (29, 25), (0, 25), (0, 13), (7, 13)], 'rects': {0: (7, 7), 1: (3, 5), 2: (4, 9), 3: (5, 6), 4: (4, 7), 5: (4, 7), 6: (8, 3), 7: (5, 5), 8: (9, 4), 9: (5, 5), 10: (4, 3), 11: (6, 9), 12: (8, 3), 13: (3, 2), 14: (5, 2), 15: (2, 7), 16: (3, 7), 17: (1, 4), 18: (9, 3), 19: (9, 2), 20: (5, 4), 21: (4, 6)}, 'required_adjacency': [(0, 1), (0, 3), (0, 13), (0, 14), (1, 2), (1, 13), (2, 4), (2, 13), (2, 14), (3, 6), (3, 14), (3, 15), (4, 12), (4, 16), (4, 20), (4, 21), (5, 6), (5, 7), (5, 17), (6, 15), (6, 17), (6, 18), (7, 8), (7, 17), (7, 19), (8, 9), (8, 19), (9, 10), (9, 19), (9, 20), (9, 21), (10, 11), (10, 21), (11, 12), (11, 21), (12, 21), (13, 14), (14, 15), (14, 16), (15, 16), (15, 18), (16, 20), (17, 18), (17, 19), (18, 19), (18, 20), (19, 20), (20, 21)], 'interior': [13, 14, 15, 16, 17, 18, 19, 20, 21]},
+    28: {'name': 'Irregular Stepped-Bottom Staggered T-Shape (22 rooms: 13 exterior, 9 diverse interior)', 'polygon': [(7, 0), (14, 0), (14, 3), (21, 3), (21, 13), (29, 13), (29, 25), (0, 25), (0, 11), (7, 11)], 'rects': {0: (7, 7), 1: (3, 4), 2: (4, 6), 3: (5, 4), 4: (4, 7), 5: (7, 2), 6: (4, 7), 7: (5, 5), 8: (9, 4), 9: (5, 5), 10: (4, 3), 11: (6, 9), 12: (8, 3), 13: (5, 2), 14: (2, 7), 15: (3, 7), 16: (5, 2), 17: (8, 3), 18: (1, 4), 19: (9, 5), 20: (5, 4), 21: (4, 6)}, 'required_adjacency': [(0, 1), (0, 3), (0, 13), (1, 2), (1, 13), (2, 4), (2, 13), (3, 13), (3, 14), (3, 16), (4, 12), (4, 15), (4, 20), (4, 21), (5, 6), (5, 16), (5, 17), (6, 7), (6, 17), (6, 18), (7, 8), (7, 18), (7, 19), (8, 9), (8, 19), (9, 10), (9, 19), (9, 20), (9, 21), (10, 11), (10, 21), (11, 12), (11, 21), (12, 21), (13, 14), (13, 15), (14, 15), (14, 16), (14, 17), (14, 19), (15, 20), (16, 17), (17, 18), (17, 19), (18, 19), (19, 20), (20, 21)], 'interior': [13, 14, 15, 16, 17, 18, 19, 20, 21]},
 }
 
-DEFAULT_EXAMPLE = 14
+DEFAULT_EXAMPLE = 27
 
 
 # --------------------------------------------------------------------------
@@ -1454,7 +1808,7 @@ def run_custom_example(max_solutions: int = 5, time_limit: Optional[float] = 60.
         else:
             rects = {i: tuple(v) for i, v in enumerate(rects_raw)}
         adj_raw = input("required_adjacency (blank for none): ").strip()
-        required_adjacency = _parse_val(adj_raw) if adj_raw else []
+        required_adjacency = _normalize_adjacency_pairs(_parse_val(adj_raw)) if adj_raw else []
         interior_raw = input("interior rects (blank for none): ").strip()
         interior_ids = _parse_val(interior_raw) if interior_raw else []
     except Exception as exc:
