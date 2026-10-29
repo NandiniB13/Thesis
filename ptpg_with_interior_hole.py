@@ -919,6 +919,18 @@ def pack_rectangles_frontier(
             return False
         return True
 
+    def flush_line_points(pa, pb, line):
+        """Every lattice point on the shared flush line within reach of a and b
+        (a room touching both on that side can sit at any such offset)."""
+        axis, val = line
+        reach = max(max(sizes[i]) for i in sizes)
+        if axis == "x":
+            lo = min(pa[1], pb[1]) - reach; hi = max(pa[1] + pa[3], pb[1] + pb[3]) + reach
+        else:
+            lo = min(pa[0], pb[0]) - reach; hi = max(pa[0] + pa[2], pb[0] + pb[2]) + reach
+        n = int(round((hi - lo) / grid_step))
+        return [((val, lo + k * grid_step) if axis == "x" else (lo + k * grid_step, val)) for k in range(n + 1)]
+
     def grid_options(idx, free_shape):
         """All lattice placements of interior rect `idx` that fit, stay off
         the plot boundary and match the required adjacency exactly against
@@ -944,7 +956,7 @@ def pack_rectangles_frontier(
                     for shared in _shared_corners(placements[a], placements[b]):
                         line = _perpendicular_search_line(placements[a], placements[b], shared)
                         if line is not None:
-                            pts.extend(_anchor_points_on_line(free_shape, *line))
+                            pts.extend(flush_line_points(placements[a], placements[b], line))
             if pts is not None:
                 seen = set()
                 for pt in pts:
@@ -1105,7 +1117,7 @@ def pack_rectangles_frontier(
                         for shared in _shared_corners(placements[a], placements[b]):
                             line = _perpendicular_search_line(placements[a], placements[b], shared)
                             if line is not None:
-                                points_to_try.extend(_anchor_points_on_line(cur_free, *line))
+                                points_to_try.extend(flush_line_points(placements[a], placements[b], line))
 
                         any_option = False
                         # rectangular union: the forced placement is only an
