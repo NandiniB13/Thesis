@@ -295,6 +295,9 @@ def _point_on_rect_edge(vx: float, vy: float, rx: float, ry: float, w: float, h:
     return on_vert_edge or on_horiz_edge
 
 
+_REFLEX_REPEAT = {'on': False, 'verts': set()}
+
+
 def _new_frontier_points(rx, ry, w, h, used_point, free_shape=None):
     """The rectangle's exposed corners for further growth: the 2 corners
     adjacent to the one it was anchored at, plus the diagonal corner if
@@ -319,6 +322,8 @@ def _new_frontier_points(rx, ry, w, h, used_point, free_shape=None):
     )
     live_verts = _polygon_vertices(free_shape)
     result = list(adjacent)
+    if _REFLEX_REPEAT['on'] and (round(px, 6), round(py, 6)) in _REFLEX_REPEAT['verts']:
+        result.append((px, py))   # a plot reflex vertex stays an anchor for this room's partners
     if any(abs(diagonal[0] - vx) < 1e-9 and abs(diagonal[1] - vy) < 1e-9 for (vx, vy) in live_verts):
         result.append(diagonal)
     for (vx, vy) in live_verts:
@@ -420,7 +425,7 @@ def _anchor_points_on_line(free_shape, axis: str, value: float, tol: float = 1e-
     return [p for p in verts if abs(p[idx] - value) < tol]
 
 
-def pack_rectangles_frontier(
+def _pack_once(
     polygon,
     rects: Dict[int, Size],
     required_adjacency=None,
@@ -438,6 +443,11 @@ def pack_rectangles_frontier(
     interior_corner_rule: bool = True,
     interior_grid: bool = True,
     weak_forward_check: bool = True,
+    full_flush: bool = False,
+    always_skip: bool = False,
+    reflex_repeat: bool = False,
+    exhaustive_seed: bool = False,
+    prune_empty_queue: bool = False,
 ):
     """PTPG-driven frontier search. Returns (found, placements_or_None,
     nodes_explored). found is True / False / None (feasible / proven
@@ -589,6 +599,8 @@ def pack_rectangles_frontier(
         and (not hole_mode or (i not in interior and require_boundary_touch))
     }
 
+    _REFLEX_REPEAT['on'] = bool(reflex_repeat)
+    _REFLEX_REPEAT['verts'] = {(round(float(v[0]), 6), round(float(v[1]), 6)) for v in plot_vertices} - {(round(float(v[0]), 6), round(float(v[1]), 6)) for v in convex_vertices}
     placements: Dict[int, Placement] = {}
     nodes = [0]
     deadline = time.perf_counter() + time_limit if time_limit is not None else None
@@ -732,6 +744,13 @@ def pack_rectangles_frontier(
         anchor_verts = [p for p in verts if boundary.distance(Point(p)) < 1e-9]
         if interior_phase():
             anchor_verts = list(verts)   # interior rooms sit inside enclosed pockets
+        if exhaustive_seed:
+            # complete seeding: every valid layout has exactly one room with a corner at
+            # each convex plot vertex, so ONE live convex vertex with EVERY room tried
+            # there (all degree levels, no score filter) covers every layout.
+            conv = [p for p in anchor_verts if any(abs(p[0] - vx) < 1e-9 and abs(p[1] - vy) < 1e-9 for (vx, vy) in convex_vertices)]
+            if conv and not interior_phase():
+                anchor_verts = [min(conv)]
         remaining = ready_ids()
         # exhaustive corner clause: every layout has each unplaced
         # triangle-corner rect on a free convex plot corner. Seed ONE of
@@ -782,7 +801,7 @@ def pack_rectangles_frontier(
             for level in sorted({d for d, _, _, _, _ in scored}):
                 level_score = min(sc for d, sc, _, _, _ in scored if d == level)
                 tied = sorted(
-                    ((idx, opts) for d, sc, _, idx, opts in scored if (d, sc) == (level, level_score)),
+                    ((idx, opts) for d, sc, _, idx, opts in scored if (d == level if exhaustive_seed else (d, sc) == (level, level_score))),
                     key=lambda t: -(sizes[t[0]][0] * sizes[t[0]][1]),
                 )
                 is_inner_l = 0 if (level == 1 and p in inner_l_points) else 1
@@ -919,9 +938,13 @@ def pack_rectangles_frontier(
             return False
         return True
 
-    def flush_line_points(pa, pb, line):
-        """Every lattice point on the shared flush line within reach of a and b
-        (a room touching both on that side can sit at any such offset)."""
+    def flush_line_points(pa, pb, line, free):
+        """Points a room touching both pa and pb on their shared flush line may
+        anchor at. Fast pass: vertices of the free polygon on that line (the
+        original shortcut). Full pass (full_flush=True): every lattice offset
+        along the line within reach of pa and pb (complete)."""
+        if not full_flush:
+            return _anchor_points_on_line(free, *line)
         axis, val = line
         reach = max(max(sizes[i]) for i in sizes)
         if axis == "x":
@@ -956,7 +979,7 @@ def pack_rectangles_frontier(
                     for shared in _shared_corners(placements[a], placements[b]):
                         line = _perpendicular_search_line(placements[a], placements[b], shared)
                         if line is not None:
-                            pts.extend(flush_line_points(placements[a], placements[b], line))
+                            pts.extend(flush_line_points(placements[a], placements[b], line, free_shape))
             if pts is not None:
                 seen = set()
                 for pt in pts:
@@ -1117,7 +1140,7 @@ def pack_rectangles_frontier(
                         for shared in _shared_corners(placements[a], placements[b]):
                             line = _perpendicular_search_line(placements[a], placements[b], shared)
                             if line is not None:
-                                points_to_try.extend(flush_line_points(placements[a], placements[b], line))
+                                points_to_try.extend(flush_line_points(placements[a], placements[b], line, cur_free))
 
                         any_option = False
                         # rectangular union: the forced placement is only an
@@ -1149,10 +1172,15 @@ def pack_rectangles_frontier(
             # every candidate failed here; if `originator` has no other
             # pending point left, this is a verified dead end
             still_pending_for_originator = any(o == originator for (_, o) in rest)
-            if not still_pending_for_originator:
+            if not still_pending_for_originator and not always_skip:
                 return False
             return solve(free_shape, rest)
 
+        # empty queue with an unplaced boundary room: dead (Lemma 2 of the proof). Boundary rooms are
+        # linked along the wall, so in any valid layout an unplaced boundary room is always reachable
+        # from a placed one through a queue entry; a fresh seed would only start a disconnected cluster.
+        if prune_empty_queue and hole_mode and placements and active is None and any(i not in interior for i in remaining):
+            return False
         # frontier empty: seed a fresh rectangle, point-first
         per_point = region_seed(free_shape, active) if active is not None else seed_step(free_shape)
         if not per_point:
@@ -1533,3 +1561,38 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+def pack_rectangles_frontier(polygon, rects, required_adjacency=None, *, time_limit=60.0, complete_pass=True, prune_empty_queue=None, **kw):
+    """Fast search followed by a complete last-resort pass.
+
+    Pass 1 is the fast search (the attached solver unchanged). A layout found
+    (True) or a timeout (None) is returned as is. If pass 1 says INFEASIBLE
+    (False) and `complete_pass` is True, pass 2 re-runs the search using only
+    steps that are necessary conditions, and ITS False is the proof:
+      * the dead-end `return False` is replaced by always skipping the point
+        (`always_skip=True`), so interior rooms always reach the grid phase;
+      * the triangle shortcut is off (`triangle_shortcut=False`), so the grid
+        phase and the frontier use no forced positions;
+      * the triangle-corner rule uses its proven form (`hole_corner_rules=False`);
+      * `exhaustive_seed=True`: the first seed tries EVERY room at one convex plot
+        vertex (pass 1 keeps only the best-scored rooms per degree level);
+      * `reflex_repeat=True`: a plot reflex vertex that was used as an anchor is
+        offered again to the placed room's other partners;
+      * `full_flush=True` (only matters if a caller re-enables the shortcut).
+    `prune_empty_queue` (default: on for plots with at most one reflex vertex): a branch whose
+    frontier is empty while a boundary room is unplaced is dead (Lemma 2); both passes use it.
+    Each pass gets `time_limit` seconds; the node count returned is the sum.
+    """
+    if prune_empty_queue is None:
+        # sound by Lemma 2 for plots with at most one reflex vertex (every L-shape); off otherwise
+        prune_empty_queue = len(_polygon_reflex_vertices(polygon)) <= 1
+    kw['prune_empty_queue'] = prune_empty_queue
+    found, placements, nodes = _pack_once(polygon, rects, required_adjacency,
+                                          time_limit=time_limit, **kw)
+    if found is not False or not complete_pass:
+        return found, placements, nodes
+    kw2 = dict(kw)
+    kw2.update(full_flush=True, always_skip=True, triangle_shortcut=False, hole_corner_rules=False, reflex_repeat=True, exhaustive_seed=True)
+    found2, placements2, nodes2 = _pack_once(polygon, rects, required_adjacency,
+                                             time_limit=time_limit, **kw2)
+    return found2, placements2, nodes + nodes2
