@@ -1,41 +1,161 @@
 """
-Exact backtracking packer: places rectangles inside a rectilinear polygon
-plot with no overlaps and no rectangle crossing the boundary.
+Exact backtracking packer: places rectangles inside a rectangular or L-shaped plot (a
+rectilinear polygon with at most one reflex vertex) with no overlaps and no rectangle crossing the
+boundary.
 
-`pack_rectangles_frontier` is the sole solver: a PTPG-driven frontier
-search built around `required_adjacency` (a set of (id_a, id_b) pairs
-over the same keys as `rects`, e.g. from a planar adjacency graph of
-which rooms must touch). It grows outward from placed rectangles using
-that graph to decide what to try next, instead of rescanning the whole
-free boundary each step; see the "Frontier / PTPG-driven search" section
-below.
+`pack_rectangles_frontier` is the sole solver: a frontier search built around
+`required_adjacency` (a set of (id_a, id_b) pairs over the same keys as `rects`: which
+rooms must touch; any two rooms that touch must be such a pair). It grows outward from
+placed rectangles using that graph to decide what to try next.
 
-The total rectangle area must equal the plot area (`check_area_match`).
-Every candidate is anchored at a live vertex of the current free
-polygon, and every placed rectangle must touch the plot boundary along
-part of one edge (`require_boundary_touch`), except `interior_ids`
-rects, which must not share any edge segment with it. When free space splits into
-several regions, the search works only on the smallest one (its area
-must equal some subset of the remaining rect areas); a region that
-cannot be filled is a dead end and the search backtracks. The final touch-graph must match
-`required_adjacency` exactly, checked incrementally as each rect is
-placed.
-
-Rectangles are identified by explicit ids (`rects` is {id: (w, h)}), the
-same ids used in `placements` and `required_adjacency`.
-
-Multi-solution mode
---------------------
-Passing `collect_solutions` (a list) keeps the search going after each
-valid packing instead of stopping at the first one, returning several
-distinct layouts (deduplicated by geometry).
+The leftover (plot minus rooms) is empty or one connected interior piece whose closure
+misses the plot boundary altogether. Every non-interior room meets the boundary (a point
+is enough); `interior_ids` rooms do not meet it at all. Coordinates are on one lattice.
+The completeness proof is the "Completeness proof" doc: with time_limit=None a False
+result means no valid layout exists.
 """
+# ---------------------------------------------------------------------------
+# interior_nosh.py -- interior_narrow.py with shapely replaced by integer bitmasks.
+# Free space is one Python int, one bit per unit cell of the lattice grid (step g);
+# fit / difference / components / vertices / boundary contact are exact bit operations.
+# Search logic is identical to interior_narrow.py.
+# ---------------------------------------------------------------------------
 import ast
 import time
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from shapely.geometry import LineString, Point, Polygon, box
-from shapely.geometry.base import BaseGeometry
+
+
+
+# --------------------------------------------------------------------------
+# Bitmask grid (replaces shapely)
+# --------------------------------------------------------------------------
+
+class _Grid:
+    pass
+
+
+_G = _Grid()
+
+
+def _poly_area(polygon) -> float:
+    n = len(polygon)
+    return abs(sum(polygon[i][0] * polygon[(i + 1) % n][1] - polygon[(i + 1) % n][0] * polygon[i][1]
+                   for i in range(n))) / 2.0
+
+
+def _setup_grid(polygon, g: float):
+    """Rasterise the rectilinear plot onto cells of side g. Cell (i, j) is bit j*stride+i
+    (stride = W+1; the extra column is padding that is never free). Lattice POINT (i, j)
+    uses the same indexing, with i in 0..W and j in 0..H."""
+    G = _G
+    G.g = g
+    xs = [int(round(p[0] / g)) for p in polygon]
+    ys = [int(round(p[1] / g)) for p in polygon]
+    G.ox, G.oy = min(xs), min(ys)
+    G.W, G.H = max(xs) - G.ox, max(ys) - G.oy
+    G.stride = s = G.W + 1
+    pts = [(x - G.ox, y - G.oy) for x, y in zip(xs, ys)]
+    n = len(pts)
+    cells = 0
+    for j in range(G.H):
+        yc = j + 0.5
+        cross = sorted(pts[k][0] for k in range(n)
+                       if pts[k][0] == pts[(k + 1) % n][0]
+                       and min(pts[k][1], pts[(k + 1) % n][1]) < yc < max(pts[k][1], pts[(k + 1) % n][1]))
+        for a in range(0, len(cross) - 1, 2):
+            for i in range(cross[a], cross[a + 1]):
+                cells |= 1 << (j * s + i)
+    G.inside = cells
+    bp = 0
+    for k in range(n):
+        (x1, y1), (x2, y2) = pts[k], pts[(k + 1) % n]
+        if x1 == x2:
+            for y in range(min(y1, y2), max(y1, y2) + 1):
+                bp |= 1 << (y * s + x1)
+        elif y1 == y2:
+            for x in range(min(x1, x2), max(x1, x2) + 1):
+                bp |= 1 << (y1 * s + x)
+        else:
+            raise ValueError("interior_nosh.py needs a rectilinear plot")
+    G.BP = bp
+    G.rowfull = (1 << s) - 1
+    G.PM = (1 << ((G.H + 1) * s)) - 1                       # all lattice points
+    G.cellmask = sum(((1 << G.W) - 1) << (j * s) for j in range(G.H))
+    # cells whose closed square meets the plot boundary
+    G.TB = (bp | (bp >> 1) | (bp >> s) | (bp >> (s + 1))) & G.cellmask
+    G.rm = {}
+
+
+def _rm(cw: int, ch: int) -> int:
+    """Mask of a cw x ch block with its lower-left bit at 0."""
+    k = (cw, ch)
+    m = _G.rm.get(k)
+    if m is None:
+        s = _G.stride
+        m = ((1 << cw) - 1) * (((1 << (s * ch)) - 1) // ((1 << s) - 1))
+        _G.rm[k] = m
+    return m
+
+
+def _cells_of(rx, ry, w, h):
+    g = _G.g
+    return int(round(rx / g)) - _G.ox, int(round(ry / g)) - _G.oy, int(round(w / g)), int(round(h / g))
+
+
+def _rect_mask(rx, ry, w, h):
+    """Cell mask of the rectangle, or None if it leaves the plot's bounding box."""
+    i, j, cw, ch = _cells_of(rx, ry, w, h)
+    if cw <= 0 or ch <= 0 or i < 0 or j < 0 or i + cw > _G.W or j + ch > _G.H:
+        return None
+    return _rm(cw, ch) << (j * _G.stride + i)
+
+
+def _diff(free, rx, ry, w, h) -> int:
+    m = _rect_mask(rx, ry, w, h)
+    return free if m is None else free & ~m
+
+
+def _bits(m: int):
+    while m:
+        low = m & -m
+        yield low.bit_length() - 1
+        m ^= low
+
+
+def _vertices_mask(F: int) -> int:
+    """Lattice points that are corners of the region F (1 or 3 of the 4 cells around the
+    point free, or 2 diagonal ones)."""
+    s = _G.stride
+    A, B, C, D = F << (s + 1), F << s, F << 1, F
+    return ((A ^ B ^ C ^ D) | (A & D & ~B & ~C) | (~A & ~D & B & C)) & _G.PM
+
+
+def _polygon_vertices(F: int) -> List[Tuple[float, float]]:
+    s, g, ox, oy = _G.stride, _G.g, _G.ox, _G.oy
+    return [(((idx % s) + ox) * g, ((idx // s) + oy) * g) for idx in _bits(_vertices_mask(F))]
+
+
+def _bounds(F: int):
+    s, g = _G.stride, _G.g
+    jmin = ((F & -F).bit_length() - 1) // s
+    jmax = (F.bit_length() - 1) // s
+    acc = 0
+    for j in range(jmin, jmax + 1):
+        acc |= (F >> (j * s)) & _G.rowfull
+    imin = (acc & -acc).bit_length() - 1
+    imax = acc.bit_length() - 1
+    return ((imin + _G.ox) * g, (jmin + _G.oy) * g, (imax + 1 + _G.ox) * g, (jmax + 1 + _G.oy) * g)
+
+
+def _carea(F: int) -> float:
+    return F.bit_count() * _G.g * _G.g
+
+
+def _on_bnd(p) -> bool:
+    g = _G.g
+    i, j = int(round(p[0] / g)) - _G.ox, int(round(p[1] / g)) - _G.oy
+    return 0 <= i <= _G.W and 0 <= j <= _G.H and bool((_G.BP >> (j * _G.stride + i)) & 1)
 
 
 class _SearchTimeout(Exception):
@@ -49,18 +169,6 @@ Placement = Tuple[float, float, float, float]
 # --------------------------------------------------------------------------
 # Geometry helpers
 # --------------------------------------------------------------------------
-
-def _polygon_vertices(shape: BaseGeometry) -> List[Tuple[float, float]]:
-    polys = list(shape.geoms) if shape.geom_type == "MultiPolygon" else [shape]
-    pts = set()
-    for p in polys:
-        if p.is_empty:
-            continue
-        pts.update(p.exterior.coords[:-1])
-        for interior in p.interiors:
-            pts.update(interior.coords[:-1])
-    return list(pts)
-
 
 def _polygon_reflex_vertices(polygon: List[Tuple[float, float]], tol: float = 1e-9) -> set:
     """Concave (reflex) vertices of the plot boundary, e.g. the inner
@@ -117,18 +225,10 @@ def _at_plot_corner(rx: float, ry: float, w: float, h: float, convex_vertices, t
     )
 
 
-def _vertex_in_closed_box(rx, ry, w, h, vertices, tol: float = 1e-9) -> bool:
-    """True if any plot vertex lies in the closed rectangle (corner, on an
-    edge, or inside)."""
-    return any(rx - tol <= vx <= rx + w + tol and ry - tol <= vy <= ry + h + tol
-               for (vx, vy) in vertices)
-
-
 def check_area_match(polygon, rects: Dict[int, Size], tol: float = 1e-6) -> Tuple[bool, str]:
     """(True, "") if the rects' total area is <= the plot area, else
-    (False, message). Total area < plot area leaves a hole (see
-    `allow_hole` / `single_hole` in `pack_rectangles_frontier`)."""
-    plot_area = Polygon(polygon).area
+    (False, message). Total area < plot area leaves a hole."""
+    plot_area = _poly_area(polygon)
     rect_area = sum(w * h for w, h in rects.values())
     if rect_area > plot_area + tol:
         return False, (f"total rect area {rect_area:g} > plot area {plot_area:g} "
@@ -201,39 +301,28 @@ def check_no_isolated(rects: Dict[int, Size], required_adjacency, interior_ids=(
     return True, ""
 
 
-def _touches_boundary_edge(shape: BaseGeometry, boundary, tol: float = 1e-9) -> bool:
-    """True if `shape` meets the plot boundary AT ALL -- a shared edge
-    segment or even a single point counts. (Name kept; used for the hole
-    and for free-space pieces.)"""
-    return shape.intersects(boundary)
+def _touches_boundary_edge(shape: int) -> bool:
+    """True if the cell piece `shape` meets the plot boundary AT ALL (an edge or a point)."""
+    return bool(shape & _G.TB)
 
 
-def _touches_boundary(rx: float, ry: float, w: float, h: float, boundary) -> bool:
-    """True if the closed rectangle meets the plot boundary at all (an edge
-    segment or a single point). A rect that does NOT is an interior rect."""
-    return box(rx, ry, rx + w, ry + h).intersects(boundary)
-
-
-def _rect_fits(free_shape: BaseGeometry, candidate: BaseGeometry) -> bool:
-    if free_shape.is_empty:
+def _touches_boundary(rx: float, ry: float, w: float, h: float) -> bool:
+    """True if the closed rectangle meets the plot boundary at all (an edge segment or a
+    single point). A rect that does NOT is an interior rect. Inside the plot the boundary
+    lies on lattice lines, so it meets the closed rectangle iff a boundary lattice point
+    does."""
+    i, j, cw, ch = _cells_of(rx, ry, w, h)
+    i0, j0, i1, j1 = max(i, 0), max(j, 0), min(i + cw, _G.W), min(j + ch, _G.H)
+    if i0 > i1 or j0 > j1:
         return False
-    # cheap bbox reject before the expensive shapely intersection
-    fminx, fminy, fmaxx, fmaxy = free_shape.bounds
-    cminx, cminy, cmaxx, cmaxy = candidate.bounds
-    if cminx < fminx - 1e-9 or cminy < fminy - 1e-9 or cmaxx > fmaxx + 1e-9 or cmaxy > fmaxy + 1e-9:
+    return bool(_G.BP & (_rm(i1 - i0 + 1, j1 - j0 + 1) << (j0 * _G.stride + i0)))
+
+
+def _rect_fits(free: int, rx: float, ry: float, w: float, h: float) -> bool:
+    if not free:
         return False
-    return abs(free_shape.intersection(candidate).area - candidate.area) < 1e-6
-
-
-def _shares_boundary_edge(rx: float, ry: float, w: float, h: float, boundary, tol: float = 1e-9) -> bool:
-    """True if any edge of the rectangle overlaps the plot boundary by more than a point."""
-    edges = [
-        LineString([(rx, ry), (rx + w, ry)]),
-        LineString([(rx, ry + h), (rx + w, ry + h)]),
-        LineString([(rx, ry), (rx, ry + h)]),
-        LineString([(rx + w, ry), (rx + w, ry + h)]),
-    ]
-    return any(edge.length >= tol and edge.intersection(boundary).length > tol for edge in edges)
+    m = _rect_mask(rx, ry, w, h)
+    return m is not None and (free & m) == m
 
 
 def _rects_touch(a: Placement, b: Placement, tol: float = 1e-9) -> bool:
@@ -251,12 +340,22 @@ def _rects_touch(a: Placement, b: Placement, tol: float = 1e-9) -> bool:
     return False
 
 
-def _free_space_components(shape: BaseGeometry):
-    """Connected pieces of free space (exact boundaries), largest first."""
-    if shape.is_empty:
-        return []
-    comps = list(shape.geoms) if shape.geom_type == "MultiPolygon" else [shape]
-    return sorted(comps, key=lambda c: -c.area)
+def _free_space_components(F: int):
+    """4-connected pieces of free space (pieces meeting at a single point are separate),
+    largest first."""
+    s = _G.stride
+    out, rest = [], F
+    while rest:
+        c = rest & -rest
+        while True:
+            n = (c | (c << 1) | (c >> 1) | (c << s) | (c >> s)) & F
+            if n == c:
+                break
+            c = n
+        out.append(c)
+        rest &= ~c
+    out.sort(key=lambda c: -c.bit_count())
+    return out
 
 
 _ORIENTATION_OFFSETS = [(0, 0), (-1, 0), (0, -1), (-1, -1)]  # multiplied by (w, h) per call
@@ -295,7 +394,7 @@ def _point_on_rect_edge(vx: float, vy: float, rx: float, ry: float, w: float, h:
     return on_vert_edge or on_horiz_edge
 
 
-_REFLEX_REPEAT = {'on': False, 'verts': set()}
+_REFLEX_VERTS: set = set()   # plot reflex vertices; one stays an anchor for the partners of a room placed there
 
 
 def _new_frontier_points(rx, ry, w, h, used_point, free_shape=None):
@@ -322,7 +421,7 @@ def _new_frontier_points(rx, ry, w, h, used_point, free_shape=None):
     )
     live_verts = _polygon_vertices(free_shape)
     result = list(adjacent)
-    if _REFLEX_REPEAT['on'] and (round(px, 6), round(py, 6)) in _REFLEX_REPEAT['verts']:
+    if (round(px, 6), round(py, 6)) in _REFLEX_VERTS:
         result.append((px, py))   # a plot reflex vertex stays an anchor for this room's partners
     if any(abs(diagonal[0] - vx) < 1e-9 and abs(diagonal[1] - vy) < 1e-9 for (vx, vy) in live_verts):
         result.append(diagonal)
@@ -332,25 +431,6 @@ def _new_frontier_points(rx, ry, w, h, used_point, free_shape=None):
         if _point_on_rect_edge(vx, vy, rx, ry, w, h):
             result.append((vx, vy))
     return result
-
-
-def _reflex_corner(box_a: Placement, box_b: Placement):
-    """The inner (concave) corner of the L-union of two touching,
-    perpendicular rectangles. None if they're collinear (no reflex corner)."""
-    x1, y1, w1, h1 = box_a
-    x2, y2, w2, h2 = box_b
-    xs = [x1, x1 + w1, x2, x2 + w2]
-    ys = [y1, y1 + h1, y2, y2 + h2]
-    xmin, xmax = min(xs), max(xs)
-    ymin, ymax = min(ys), max(ys)
-    corners = {
-        (x1, y1), (x1 + w1, y1), (x1, y1 + h1), (x1 + w1, y1 + h1),
-        (x2, y2), (x2 + w2, y2), (x2, y2 + h2), (x2 + w2, y2 + h2),
-    }
-    for (cx, cy) in corners:
-        if xmin + 1e-9 < cx < xmax - 1e-9 and ymin + 1e-9 < cy < ymax - 1e-9:
-            return (cx, cy)
-    return None
 
 
 def _reflex_corners(box_a: Placement, box_b: Placement, tol: float = 1e-9):
@@ -418,139 +498,96 @@ def _perpendicular_search_line(box_a: Placement, box_b: Placement, shared_corner
     return None
 
 
-def _anchor_points_on_line(free_shape, axis: str, value: float, tol: float = 1e-6):
-    """Live vertices of the free polygon lying on x=value or y=value."""
-    verts = _polygon_vertices(free_shape)
-    idx = 0 if axis == "x" else 1
-    return [p for p in verts if abs(p[idx] - value) < tol]
+def _flush_side_has_room(pa, pb, free_shape, t_size, step, tol=1e-9):
+    """a and b meet flush on a straight line (they share a corner and have
+    collinear edges). True if a room of size `t_size` (either orientation)
+    can be placed on the FREE side of that line, with a side on the line,
+    overlapping a's edge AND b's edge by a positive length, entirely inside
+    the free space (not on a boundary or an already-placed rect)."""
+    for sc in _shared_corners(pa, pb):
+        ln = _perpendicular_search_line(pa, pb, sc)
+        if ln is None:
+            continue
+        axis, v = ln
+        i = 0 if axis == "x" else 1          # coordinate that is fixed (= v)
+        j = 1 - i                            # coordinate along the line
+        a_lo, a_hi = pa[j], pa[j] + pa[2 + j]
+        b_lo, b_hi = pb[j], pb[j] + pb[2 + j]
+        bodies_before = abs(pa[i] + pa[2 + i] - v) < tol   # a, b lie before the line
+        for tw, th in {t_size, (t_size[1], t_size[0])}:
+            t_across = (tw, th)[i]           # t's extent across the line
+            t_along = (tw, th)[j]            # t's extent along the line
+            lo = min(a_lo, b_lo) - t_along
+            hi = max(a_hi, b_hi)
+            n = int(round((hi - lo) / step))
+            for k in range(n + 1):
+                s0 = lo + k * step
+                if min(s0 + t_along, a_hi) - max(s0, a_lo) <= tol:
+                    continue
+                if min(s0 + t_along, b_hi) - max(s0, b_lo) <= tol:
+                    continue
+                c0 = v if bodies_before else v - t_across
+                if i == 0:
+                    ok = _rect_fits(free_shape, c0, s0, t_across, t_along)
+                else:
+                    ok = _rect_fits(free_shape, s0, c0, t_along, t_across)
+                if ok:
+                    return True
+    return False
 
 
-def _pack_once(
+def _forced_points(pa, pb, free_shape, t_size, step):
+    """Anchor points where a room t that must touch BOTH placed rooms a and
+    b is forced to have a corner, or None when nothing is forced.
+    Not forced when: a,b join into a rectangle; or a,b meet flush on a
+    line and t fits on the free side of that line (t may then sit anywhere
+    along the line -- left to the normal search / lattice grid). Otherwise
+    t can only touch both of them by having a corner on a reflex corner of
+    their L-shaped/stepped union."""
+    if _union_is_rectangle(pa, pb):
+        return None
+    if _flush_side_has_room(pa, pb, free_shape, t_size, step):
+        return None
+    pts = _reflex_corners(pa, pb)
+    return pts or None
+
+
+def pack_rectangles_frontier(
     polygon,
     rects: Dict[int, Size],
     required_adjacency=None,
     *,
-    require_boundary_touch: bool = True,
     interior_ids: Iterable[int] = (),
     time_limit: Optional[float] = 60.0,
     collect_solutions: Optional[list] = None,
     max_solutions: Optional[int] = None,
-    single_hole: bool = True,
-    hole_corner_rules: bool = True,
-    triangle_shortcut: bool = True,
-    rect_union_try: bool = False,
-    border_first: bool = False,
-    interior_corner_rule: bool = True,
-    interior_grid: bool = True,
-    weak_forward_check: bool = True,
-    full_flush: bool = False,
-    always_skip: bool = False,
-    reflex_repeat: bool = False,
-    exhaustive_seed: bool = False,
-    prune_empty_queue: bool = False,
 ):
-    """PTPG-driven frontier search. Returns (found, placements_or_None,
-    nodes_explored). found is True / False / None (feasible / proven
-    infeasible / cut off by time_limit). Returns False immediately if the
-    total rect area exceeds the plot area (`check_area_match`) or if any
-    rect has no required neighbour, the required adjacency is not one connected
-    graph, or every rect is interior (`check_no_isolated`).
+    """Frontier search. Returns (found, placements_or_None, nodes_explored).
+    found is True / False / None (feasible / proven infeasible / cut off by
+    time_limit). Returns False immediately if the total room area exceeds the
+    plot area, if some room has no required neighbour, if the required adjacency
+    is not one connected graph, or if every room is interior.
 
-    If the total rect area is < the plot area the leftover is a HOLE. The
-    hole must be interior: no leftover piece may touch the plot boundary at
-    all (not even at a single point), and with `single_hole`
-    (default) the leftover must be one connected piece. The leftover area
-    is fixed (plot area - rect area) so it is also a pruning budget. When
-    the areas are equal the search is the exact-tiling search.
+    The leftover (plot area minus room area, zero for an exact tiling) must be
+    empty or one connected piece that does not touch the plot boundary at all.
+    `interior_ids` rooms must not touch the plot boundary (not even at a point);
+    every other room must meet it (a point is enough). `time_limit` (seconds,
+    wall-clock; None = unbounded) is checked in every hot loop.
 
-    `triangle_shortcut` (default True): right after placing a rect the
-    search forces in a required partner shared by it and its originator,
-    anchored at their reflex corner or on the shared perpendicular line --
-    but ONLY when the two rects do not join into a single rectangle
-    (`_union_is_rectangle`). If they do (e.g. two rooms side by side), the
-    shared partner is left to the normal chain order: seed, a partner of
-    the seed, a partner of THAT rect, and so on. False switches the
-    shortcut off entirely.
-
-    `rect_union_try` (default False): when the two placed rects join into a
-    single rectangle the shortcut is still ATTEMPTED (forced placement of
-    the shared partner), but unlike the non-rectangular case a failed
-    attempt is not a dead end: the search falls back to the normal
-    unforced continuation. False skips the shortcut for rectangular unions
-    altogether.
-
-    `interior_grid` (default True): everything runs as before until every
-    boundary room is placed. From then on the interior rooms that are still
-    unplaced are placed on a GRID instead of at corners of the free space:
-    every lattice position (step = gcd of all plot coordinates and room
-    sizes), both orientations, where the room fits in the free space, is not
-    on the plot boundary and satisfies the required adjacency against every
-    room already placed (touch iff required). The room with the fewest such
-    positions goes next. Free space that still touches the plot boundary at
-    that moment can never be filled by interior rooms, so it ends the
-    branch. With whole-number data this is complete for the remaining
-    interior rooms (a floating room can sit anywhere in the pocket).
-
-    `interior_corner_rule` (default True): interior rooms are placed
-    whenever the normal search reaches them (no ordering), but the corner
-    points an interior room exposes may only be used to place OTHER
-    INTERIOR rooms. A boundary room is never anchored at a frontier point
-    that came from an interior room (the same holds for the triangle
-    shortcut: a boundary room is not forced in next to an interior pair).
-    Boundary rooms still get their anchors from the plot boundary and from
-    other boundary rooms.
-
-    `border_first` (default False): interior rooms (`interior_ids`) are not
-    placed until EVERY boundary room has been placed. While boundary rooms
-    remain, interior rooms are not candidates anywhere (frontier, seeds,
-    triangle shortcut, region seeding) and free-space pieces that do not
-    touch the plot boundary are left alone. Once the last boundary room is
-    down, seeding may anchor at any free-space vertex, not only at ones on
-    the plot boundary, so the interior rooms can be placed inside the
-    pockets the boundary rooms enclosed. If that ordering finds nothing,
-    the search is rerun once with no ordering restriction, so a `False`
-    never rests on the ordering alone.
-
-    `hole_corner_rules` (default True) keeps the triangle-corner placement
-    filter and the exhaustive corner clause on in hole mode too, applied to
-    every boundary rect (see the comment at `triangle_corner_ids`). This is
-    NOT proven sound for rects that meet the boundary only at a point or
-    whose side ends at a plot vertex; pass False for the guarded filter
-    (edge-contact rects, no plot vertex in the box) and no corner clause.
-
-    `interior_ids` are rects that must not touch the plot boundary at all
-    (no shared edge segment and no single-point contact). Every other rect
-    is a boundary rect: with `require_boundary_touch` it must meet the
-    boundary, and a single-point contact is enough.
-
-    `time_limit` (seconds, wall-clock; None = unbounded) is checked via
-    `_check_time` in every hot loop, not just `solve()`, since real work
-    (a vertex scan) can happen without calling `solve()` again in
-    between. Exceeding it raises
-    `_SearchTimeout`, caught once at the bottom of this function.
-
-    `required_adjacency` (an iterable of (id_a, id_b) pairs over the same
-    ids as `rects`) is optional -- `None`/`[]` means no adjacency
-    constraint (every rect is its own region, re-seeded independently;
-    `require_boundary_touch` still applies).
-
-    Pass `collect_solutions` (a list) to keep searching past the first
-    valid placement: each is appended and the search backtracks for a
-    genuinely different one, up to `max_solutions` (None = exhaustive).
-    In this mode the second return value is always `collect_solutions`
-    itself."""
+    Pass `collect_solutions` (a list) to keep searching past the first valid
+    layout: each new one is appended and the search backtracks for a genuinely
+    different one, up to `max_solutions` (None = exhaustive). In this mode the
+    second return value is always `collect_solutions` itself, and the first one
+    is True only if `max_solutions` was reached. The completeness proof is for
+    the default single-solution mode."""
     sizes = dict(rects)
     if not check_area_match(polygon, sizes)[0]:
         return False, collect_solutions, 0
     if not check_no_isolated(sizes, required_adjacency, interior_ids)[0]:
         return False, collect_solutions, 0
-    hole_mode = Polygon(polygon).area - sum(w * h for w, h in sizes.values()) > 1e-6
 
-    boundary = Polygon(polygon).boundary
-    poly = Polygon(polygon)
     inner_l_points = _polygon_reflex_vertices(polygon)
     convex_vertices = _polygon_convex_vertices(polygon)
-    plot_vertices = list(polygon)
     required_adjacency = required_adjacency or []
     interior = set(interior_ids)
     unknown = interior - set(sizes)
@@ -570,38 +607,21 @@ def _pack_once(
         if a not in required_partners[b]:
             required_partners[b].append(a)
 
-    # Triangle-corner rule: a rect with exactly 2 partners that touch each
-    # other must sit on a convex plot corner.
-    #  * Exact tiling (area == plot area): every side is covered by a
-    #    neighbour or the boundary and a neighbour covers only one side, so
-    #    the rect has two perpendicular sides on the boundary. Applies to
-    #    every rect.
-    #  * Hole allowed: valid only for BOUNDARY rects (they must share an edge
-    #    with the plot boundary). Of the sides perpendicular to its boundary
-    #    side, none can face the (interior) hole -- the hole would reach the
-    #    boundary at that side's end point -- and the 2 partners cover at
-    #    most 2 sides (they touch each other, so they are not opposite), so
-    #    the remaining perpendicular side is boundary too: a corner. An
-    #    interior rect may have sides facing the hole, so it is excluded.
-    #    The "hole would reach the boundary" step needs the boundary to run
-    #    straight past the end of that side, which fails at a plot vertex
-    #    (e.g. a reflex corner right beside the rect: the hole may sit there
-    #    and touch the boundary only at that point). So in hole mode the
-    #    placement filter is skipped for any rect whose box touches a plot
-    #    vertex, and for a rect that meets the boundary only at a point (the
-    #    argument needs a shared edge segment), and the exhaustive corner clause in `seed_step` (which
-    #    assumes the plain rule) is off.
-    # Sufficient, not necessary. `placements_of` rejects these rects away
-    # from convex plot corners and `seed_step` tries them first.
+    # Triangle-corner rule (3b): a boundary room with exactly 2 partners that touch
+    # each other must have a corner on a convex plot vertex. `placements_of` rejects
+    # such a room away from convex corners and `seed_step` tries them first.
     triangle_corner_ids = {
         i for i, ps in required_partners.items()
         if len(ps) == 2 and ps[1] in required_partners.get(ps[0], [])
-        and (not hole_mode or (i not in interior and require_boundary_touch))
+        and i not in interior
     }
 
-    _REFLEX_REPEAT['on'] = bool(reflex_repeat)
-    _REFLEX_REPEAT['verts'] = {(round(float(v[0]), 6), round(float(v[1]), 6)) for v in plot_vertices} - {(round(float(v[0]), 6), round(float(v[1]), 6)) for v in convex_vertices}
+    if len(inner_l_points) > 1:
+        raise ValueError("the plot may have at most one reflex vertex (a rectangle or an L-shape)")
+    _REFLEX_VERTS.clear()
+    _REFLEX_VERTS.update((round(float(v[0]), 6), round(float(v[1]), 6)) for v in inner_l_points)
     placements: Dict[int, Placement] = {}
+    corner_ban: set = set()   # rooms already refuted on a convex plot corner (corner sweep)
     nodes = [0]
     deadline = time.perf_counter() + time_limit if time_limit is not None else None
 
@@ -618,10 +638,10 @@ def _pack_once(
         return True
 
     def boundary_ok(idx, rx, ry, w, h) -> bool:
-        touches = _touches_boundary(rx, ry, w, h, boundary)
+        touches = _touches_boundary(rx, ry, w, h)
         if idx in interior:
             return not touches
-        return touches or not require_boundary_touch
+        return touches
 
     def placements_of(idx, point, free_shape):
         """All valid (rx, ry, w, h, new_free) placements of rect `idx`
@@ -634,19 +654,17 @@ def _pack_once(
         for uw, uh in {(w0, h0), (h0, w0)}:
             for ox, oy in _candidate_offsets(uw, uh):
                 rx, ry = px + ox, py + oy
-                candidate = box(rx, ry, rx + uw, ry + uh)
-                if not _rect_fits(free_shape, candidate):
+                if not _rect_fits(free_shape, rx, ry, uw, uh):
                     continue
-                if (idx in triangle_corner_ids and not _at_plot_corner(rx, ry, uw, uh, convex_vertices)
-                        and not (hole_mode and not hole_corner_rules
-                                 and (not _shares_boundary_edge(rx, ry, uw, uh, boundary)
-                                      or _vertex_in_closed_box(rx, ry, uw, uh, plot_vertices)))):
+                if corner_ban and idx in corner_ban and _at_plot_corner(rx, ry, uw, uh, convex_vertices):
+                    continue
+                if idx in triangle_corner_ids and not _at_plot_corner(rx, ry, uw, uh, convex_vertices):
                     continue
                 if not boundary_ok(idx, rx, ry, uw, uh):
                     continue
                 if not required_adjacency_ok(idx, rx, ry, uw, uh):
                     continue
-                new_free = free_shape.difference(candidate)
+                new_free = _diff(free_shape, rx, ry, uw, uh)
                 out.append((rx, ry, uw, uh, new_free))
         return out
 
@@ -669,14 +687,14 @@ def _pack_once(
             _check_time()
             if placements_of(q_idx, v, free_shape):
                 return True
-        if not weak_forward_check:
-            return False
-        # weakened check: a room may slide along a wall and have no corner
+        # exact check: a room may slide along a wall and have no corner
         # on a free-space corner yet. Look for ANY lattice position where
         # it fits and matches the required adjacency exactly (cheap
         # adjacency / boundary tests first, shapely fit last).
         w0, h0 = sizes[q_idx]
-        fminx, fminy, fmaxx, fmaxy = free_shape.bounds
+        if not free_shape:
+            return False
+        fminx, fminy, fmaxx, fmaxy = _bounds(free_shape)
         for uw, uh in {(w0, h0), (h0, w0)}:
             nx = int(round((fmaxx - uw - fminx) / grid_step))
             ny = int(round((fmaxy - uh - fminy) / grid_step))
@@ -689,7 +707,7 @@ def _pack_once(
                     if not boundary_ok(q_idx, rx, ry, uw, uh):
                         continue
                     _check_time()
-                    if _rect_fits(free_shape, box(rx, ry, rx + uw, ry + uh)):
+                    if _rect_fits(free_shape, rx, ry, uw, uh):
                         return True
         return False
 
@@ -714,7 +732,7 @@ def _pack_once(
     def point_score(point, originator, free_shape):
         """MRV score for a frontier point: score of its most constrained
         PTPG-eligible candidate, +inf if none."""
-        candidates = [i for i in required_partners.get(originator, []) if i in remaining_ids() and interior_ready(i) and eligible(originator, i)]
+        candidates = [i for i in required_partners.get(originator, []) if i in remaining_ids() and eligible(originator, i)]
         if not candidates:
             return float("inf")
         return min(local_score(i, point, free_shape) for i in candidates)
@@ -741,25 +759,22 @@ def _pack_once(
         since a degree-1 room tends to sit in a plot's inward notch on real
         floorplans."""
         verts = _polygon_vertices(free_shape)
-        anchor_verts = [p for p in verts if boundary.distance(Point(p)) < 1e-9]
-        if interior_phase():
-            anchor_verts = list(verts)   # interior rooms sit inside enclosed pockets
-        if exhaustive_seed:
-            # complete seeding: every valid layout has exactly one room with a corner at
-            # each convex plot vertex, so ONE live convex vertex with EVERY room tried
-            # there (all degree levels, no score filter) covers every layout.
-            conv = [p for p in anchor_verts if any(abs(p[0] - vx) < 1e-9 and abs(p[1] - vy) < 1e-9 for (vx, vy) in convex_vertices)]
-            if conv and not interior_phase():
-                anchor_verts = [min(conv)]
-        remaining = ready_ids()
+        anchor_verts = [p for p in verts if _on_bnd(p)]
+        all_anchor_verts = list(anchor_verts)   # the corner clause below needs EVERY live convex corner
+        # every valid layout has exactly one room with a corner at each convex plot
+        # vertex, so ONE live convex vertex with EVERY room tried there covers every layout
+        conv = [p for p in anchor_verts if any(abs(p[0] - vx) < 1e-9 and abs(p[1] - vy) < 1e-9 for (vx, vy) in convex_vertices)]
+        if conv:
+            anchor_verts = [min(conv)]
+        remaining = remaining_ids()
         # exhaustive corner clause: every layout has each unplaced
         # triangle-corner rect on a free convex plot corner. Seed ONE of
         # them (the one with the fewest corner placements) at every such
         # corner; if all of those seeds fail, no layout exists: stop.
-        corner_ids = [i for i in remaining if i in triangle_corner_ids] if (not hole_mode or hole_corner_rules) else []
+        corner_ids = [i for i in remaining if i in triangle_corner_ids]
         if corner_ids:
             corner_anchors = [
-                p for p in anchor_verts
+                p for p in all_anchor_verts
                 if any(abs(p[0] - vx) < 1e-9 and abs(p[1] - vy) < 1e-9 for (vx, vy) in convex_vertices)
             ]
             table = {}
@@ -783,6 +798,33 @@ def _pack_once(
 
             return [(0, corner_key(p)[0], p, [(idx, table[idx][p])]) for p in sorted(table[idx], key=corner_key)]
 
+        # corner sweep: take the rooms in a decided order (fewest corner placements first, then
+        # fewest partners, then larger area); try ONE room at EVERY live convex corner; if that
+        # room fails everywhere, move on to the next room and from then on forbid the failed
+        # rooms from sitting on a convex plot corner (their branch refuted every layout that
+        # has them there). Empty result: no room can sit on any convex corner -> no layout.
+        conv_all = [p for p in all_anchor_verts
+                    if any(abs(p[0] - vx) < 1e-9 and abs(p[1] - vy) < 1e-9 for (vx, vy) in convex_vertices)]
+        if conv_all:
+            rows = []
+            for idx in remaining:
+                seen, per_pt = set(), {}
+                for p in conv_all:
+                    _check_time()
+                    opts = [o for o in placements_of(idx, p, free_shape) if o[:4] not in seen]
+                    seen.update(o[:4] for o in opts)
+                    if opts:
+                        per_pt[p] = opts
+                if per_pt:
+                    w, h = sizes[idx]
+                    rows.append((len(required_partners.get(idx, [])), -(w * h), sum(len(o) for o in per_pt.values()), idx, per_pt))
+            rows.sort(key=lambda r: r[:4])
+            out, banned = [], []
+            for (deg, _a, _n, idx, per_pt) in rows:
+                for p in sorted(per_pt):
+                    out.append((deg, 0, p, [(idx, per_pt[p])], tuple(banned)))
+                banned.append(idx)
+            return out
         per_point = []
         for p in anchor_verts:
             _check_time()
@@ -801,7 +843,7 @@ def _pack_once(
             for level in sorted({d for d, _, _, _, _ in scored}):
                 level_score = min(sc for d, sc, _, _, _ in scored if d == level)
                 tied = sorted(
-                    ((idx, opts) for d, sc, _, idx, opts in scored if (d == level if exhaustive_seed else (d, sc) == (level, level_score))),
+                    ((idx, opts) for d, sc, _, idx, opts in scored if d == level),
                     key=lambda t: -(sizes[t[0]][0] * sizes[t[0]][1]),
                 )
                 is_inner_l = 0 if (level == 1 and p in inner_l_points) else 1
@@ -813,83 +855,25 @@ def _pack_once(
 
     border_ids = [i for i in sizes if i not in interior]
     grid_step = _lattice_step(polygon, sizes)
-    defer_on = [bool(interior) and border_first]
-
-    def interior_phase() -> bool:
-        """True once ordering is on and every boundary room is placed."""
-        return defer_on[0] and all(b in placements for b in border_ids)
-
-    def interior_ready(idx) -> bool:
-        return idx not in interior or not defer_on[0] or interior_phase()
+    _setup_grid(polygon, grid_step)
 
     def eligible(originator, idx) -> bool:
-        """May `idx` be anchored at a frontier point exposed by `originator`?"""
-        return not interior_corner_rule or originator not in interior or idx in interior
+        """May `idx` be anchored at a frontier point exposed by `originator`?
+        An interior room's corners anchor only other interior rooms."""
+        return originator not in interior or idx in interior
 
     def remaining_ids():
         return [i for i in sizes if i not in placements]
 
-    def ready_ids():
-        return [i for i in sizes if i not in placements and interior_ready(i)]
-
-    def _on_region(point, region):
-        return region.distance(Point(point)) < 1e-9
-
-    def _region_fillable(region, remaining):
-        """Necessary: some subset of the remaining rects must have total
-        area == region area, and the region must be at least as large as
-        the smallest remaining rect in both directions."""
-        if not remaining:
-            return False
-        area = region.area
-        areas = [sizes[i][0] * sizes[i][1] for i in remaining]
-        if area > sum(areas) + 1e-6:
-            return False
-        minx, miny, maxx, maxy = region.bounds
-        min_side = min(min(sizes[i]) for i in remaining)
-        if (maxx - minx) < min_side - 1e-6 or (maxy - miny) < min_side - 1e-6:
-            return False
-        if all(abs(a - round(a)) < 1e-9 for a in areas) and abs(area - round(area)) < 1e-6:
-            bits = 1
-            for a in areas:
-                bits |= bits << int(round(a))
-            return bool((bits >> int(round(area))) & 1)
-        return True
-
-    def region_seed(free_shape, region):
-        """Seed inside `region` only. Any exact tiling of the region has a
-        tile with a corner at EVERY vertex of the region, so one vertex is
-        enough: pick the one with the fewest placements (0 = dead end) and
-        branch over every rect placeable there."""
-        remaining = ready_ids()
-        best = None
-        for v in _polygon_vertices(region):
-            _check_time()
-            rows, total = [], 0
-            for idx in remaining:
-                opts = placements_of(idx, v, free_shape)
-                if opts:
-                    w, h = sizes[idx]
-                    rows.append((len(required_partners.get(idx, [])), _slot_count(opts, v), -(w * h), idx, opts))
-                    total += len(opts)
-            if total == 0:
-                return None
-            if best is None or (total, v) < best[0]:
-                best = ((total, v), v, rows)
-        _, v, rows = best
-        rows.sort(key=lambda r: r[:4])
-        return [(r[0], r[1], v, [(r[3], r[4])]) for r in rows]
-
     def leftover_ok(free_shape) -> bool:
         """All rects placed: the leftover must be an interior hole -- no
-        piece shares an edge segment with the plot boundary, and (if
-        `single_hole`) it is one connected piece."""
-        if free_shape.is_empty or free_shape.area < 1e-9:
+        piece touches the plot boundary, and it is one connected piece."""
+        if not free_shape:
             return True
-        comps = [c for c in _free_space_components(free_shape) if c.area > 1e-9]
-        if single_hole and len(comps) > 1:
+        comps = _free_space_components(free_shape)
+        if len(comps) > 1:
             return False
-        return not any(_touches_boundary_edge(c, boundary) for c in comps)
+        return not any(_touches_boundary_edge(c) for c in comps)
 
     def hole_prune_ok(free_shape, remaining) -> bool:
         """Hole-mode pruning (sound). (1) Free area is plot area - placed
@@ -899,12 +883,10 @@ def _pack_once(
         rects must fill it except for at most the hole budget H (subset-sum
         window on area, and it must be big enough for the smallest
         remaining rect). (3) More than one
-        interior piece that cannot be filled at all violates `single_hole`
+        interior piece that cannot be filled at all violates the single-hole condition
         only if their combined area exceeds the budget -- already implied
         by (1), so not re-checked."""
-        if free_shape.geom_type == "Polygon":
-            return True
-        comps = [c for c in _free_space_components(free_shape) if c.area > 1e-9]
+        comps = _free_space_components(free_shape)
         if len(comps) <= 1:
             return True
         areas = [sizes[i][0] * sizes[i][1] for i in remaining]
@@ -918,19 +900,20 @@ def _pack_once(
         # the hole may still lie inside any piece that is not yet split off,
         # so a boundary piece may keep up to H of unfilled area (H = total
         # free area - remaining rect area, the fixed hole budget)
-        H = max(0.0, free_shape.area - sum(areas))
+        H = max(0.0, _carea(free_shape) - sum(areas))
         need = 0.0
         for c in comps:
-            if not _touches_boundary_edge(c, boundary):
+            if not _touches_boundary_edge(c):
                 continue
-            need += c.area
+            ca = _carea(c)
+            need += ca
             if not remaining:
                 return False
-            minx, miny, maxx, maxy = c.bounds
+            minx, miny, maxx, maxy = _bounds(c)
             if (maxx - minx) < min_side - 1e-6 or (maxy - miny) < min_side - 1e-6:
                 return False
-            if bits is not None and abs(c.area - round(c.area)) < 1e-6 and abs(H - round(H)) < 1e-6:
-                hi = int(round(c.area)); lo = max(0, hi - int(round(H)))
+            if bits is not None and abs(ca - round(ca)) < 1e-6 and abs(H - round(H)) < 1e-6:
+                hi = int(round(ca)); lo = max(0, hi - int(round(H)))
                 window = (bits >> lo) & ((1 << (hi - lo + 1)) - 1)
                 if not window:
                     return False
@@ -938,59 +921,41 @@ def _pack_once(
             return False
         return True
 
-    def flush_line_points(pa, pb, line, free):
-        """Points a room touching both pa and pb on their shared flush line may
-        anchor at. Fast pass: vertices of the free polygon on that line (the
-        original shortcut). Full pass (full_flush=True): every lattice offset
-        along the line within reach of pa and pb (complete)."""
-        if not full_flush:
-            return _anchor_points_on_line(free, *line)
-        axis, val = line
-        reach = max(max(sizes[i]) for i in sizes)
-        if axis == "x":
-            lo = min(pa[1], pb[1]) - reach; hi = max(pa[1] + pa[3], pb[1] + pb[3]) + reach
-        else:
-            lo = min(pa[0], pb[0]) - reach; hi = max(pa[0] + pa[2], pb[0] + pb[2]) + reach
-        n = int(round((hi - lo) / grid_step))
-        return [((val, lo + k * grid_step) if axis == "x" else (lo + k * grid_step, val)) for k in range(n + 1)]
-
     def grid_options(idx, free_shape):
         """All lattice placements of interior rect `idx` that fit, stay off
         the plot boundary and match the required adjacency exactly against
         every placed rect."""
         w0, h0 = sizes[idx]
-        fminx, fminy, fmaxx, fmaxy = free_shape.bounds
         out = []
+        if not free_shape:
+            return out
+        fminx, fminy, fmaxx, fmaxy = _bounds(free_shape)
         # general triangle shortcut where it applies: two placed required
         # partners of idx that require each other and whose union is not a
         # rectangle -> idx nestles at their reflex corner / shared line
-        if triangle_shortcut:
-            ps = [q for q in required_partners.get(idx, []) if q in placements]
-            pts = None
-            for i1 in range(len(ps)):
-                for i2 in range(i1 + 1, len(ps)):
-                    a, b = ps[i1], ps[i2]
-                    if b not in required_partners.get(a, []):
+        ps = [q for q in required_partners.get(idx, []) if q in placements]
+        pts = None
+        for i1 in range(len(ps)):
+            for i2 in range(i1 + 1, len(ps)):
+                a, b = ps[i1], ps[i2]
+                if b not in required_partners.get(a, []):
+                    continue
+                fp = _forced_points(placements[a], placements[b], free_shape, sizes[idx], grid_step)
+                if fp is None:
+                    continue
+                pts = (pts or [])
+                pts.extend(fp)
+        if pts is not None:
+            seen = set()
+            for pt in pts:
+                for (rx, ry, uw, uh, _nf) in placements_of(idx, pt, free_shape):
+                    k = (round(rx, 6), round(ry, 6), uw, uh)
+                    if k in seen:
                         continue
-                    if _union_is_rectangle(placements[a], placements[b]):
-                        continue
-                    pts = (pts or [])
-                    pts.extend(_reflex_corners(placements[a], placements[b]))
-                    for shared in _shared_corners(placements[a], placements[b]):
-                        line = _perpendicular_search_line(placements[a], placements[b], shared)
-                        if line is not None:
-                            pts.extend(flush_line_points(placements[a], placements[b], line, free_shape))
-            if pts is not None:
-                seen = set()
-                for pt in pts:
-                    for (rx, ry, uw, uh, _nf) in placements_of(idx, pt, free_shape):
-                        k = (round(rx, 6), round(ry, 6), uw, uh)
-                        if k in seen:
-                            continue
-                        seen.add(k)
-                        if boundary_ok(idx, rx, ry, uw, uh) and required_adjacency_ok(idx, rx, ry, uw, uh):
-                            out.append((rx, ry, uw, uh))
-                return out
+                    seen.add(k)
+                    if boundary_ok(idx, rx, ry, uw, uh) and required_adjacency_ok(idx, rx, ry, uw, uh):
+                        out.append((rx, ry, uw, uh))
+            return out
         for uw, uh in {(w0, h0), (h0, w0)}:
             nx = int(round((fmaxx - uw - fminx) / grid_step))
             ny = int(round((fmaxy - uh - fminy) / grid_step))
@@ -999,7 +964,7 @@ def _pack_once(
                 for iy in range(ny + 1):
                     ry = fminy + iy * grid_step
                     _check_time()
-                    if not _rect_fits(free_shape, box(rx, ry, rx + uw, ry + uh)):
+                    if not _rect_fits(free_shape, rx, ry, uw, uh):
                         continue
                     if not boundary_ok(idx, rx, ry, uw, uh):
                         continue
@@ -1026,26 +991,116 @@ def _pack_once(
         for (rx, ry, uw, uh) in opts:
             _check_time()
             placements[idx] = (rx, ry, uw, uh)
-            result = grid_fill(free_shape.difference(box(rx, ry, rx + uw, ry + uh)),
+            result = grid_fill(_diff(free_shape, rx, ry, uw, uh),
                                [i for i in remaining if i != idx])
             if result is True or result is None:
                 return result
             del placements[idx]
         return False
 
+    _edges = list(zip(polygon, list(polygon[1:]) + [polygon[0]]))
+    _vert_set = {(round(float(x), 6), round(float(y), 6)) for (x, y) in polygon}
+
+    def _on_wall(px, py):
+        for (x1, y1), (x2, y2) in _edges:
+            if abs(x1 - x2) < 1e-9:
+                if abs(px - x1) < 1e-9 and min(y1, y2) - 1e-9 <= py <= max(y1, y2) + 1e-9:
+                    return True
+            elif abs(py - y1) < 1e-9 and min(x1, x2) - 1e-9 <= px <= max(x1, x2) + 1e-9:
+                return True
+        return False
+
+    def _partner_fits_at(q, v, free_shape):
+        """necessary conditions only: fits in the free space with a corner at v,
+        touches the boundary, exact adjacency to every placed room"""
+        w0, h0 = sizes[q]
+        for uw, uh in {(w0, h0), (h0, w0)}:
+            for ox, oy in _candidate_offsets(uw, uh):
+                rx, ry = v[0] + ox, v[1] + oy
+                if (_rect_fits(free_shape, rx, ry, uw, uh) and boundary_ok(q, rx, ry, uw, uh)
+                        and required_adjacency_ok(q, rx, ry, uw, uh)):
+                    return True
+        return False
+
+    def wall_corner_ok(free_shape):
+        """every corner v of a placed boundary room that lies on the plot
+        boundary and is not a plot vertex needs a partner at v: placed, or
+        still able to fit there"""
+        for o, (ox_, oy_, ow, oh) in placements.items():
+            if o in interior:
+                continue
+            ps = required_partners.get(o, [])
+            for v in {(ox_, oy_), (ox_ + ow, oy_), (ox_, oy_ + oh), (ox_ + ow, oy_ + oh)}:
+                if not _on_wall(v[0], v[1]) or (round(float(v[0]), 6), round(float(v[1]), 6)) in _vert_set:
+                    continue
+                done = False
+                for j in ps:
+                    pj = placements.get(j)
+                    if pj is not None and pj[0] - 1e-9 <= v[0] <= pj[0] + pj[2] + 1e-9 and pj[1] - 1e-9 <= v[1] <= pj[1] + pj[3] + 1e-9:
+                        done = True
+                        break
+                if done:
+                    continue
+                for q in ps:
+                    if q not in placements and q not in interior and _partner_fits_at(q, v, free_shape):
+                        done = True
+                        break
+                if not done:
+                    return False
+        return True
+
+    def partner_space_ok(free_shape):
+        """Every unplaced room q that has a placed partner o must still be able
+        to touch o: some lattice position along o's four sides where q fits in
+        the free space, is boundary-consistent and exactly adjacent to every
+        placed room. Necessary conditions only."""
+        for q in sizes:
+            if q in placements:
+                continue
+            anchors = [o for o in required_partners.get(q, []) if o in placements]
+            if not anchors:
+                continue
+            ox_, oy_, ow, oh = placements[anchors[0]]
+            w0, h0 = sizes[q]
+            found = False
+            for uw, uh in {(w0, h0), (h0, w0)}:
+                cand_pos = []
+                n_y = int(round((oh + uh) / grid_step)) - 1
+                n_x = int(round((ow + uw) / grid_step)) - 1
+                for k in range(1, n_y + 1):
+                    ry = oy_ - uh + k * grid_step
+                    cand_pos.append((ox_ + ow, ry)); cand_pos.append((ox_ - uw, ry))
+                for k in range(1, n_x + 1):
+                    rx = ox_ - uw + k * grid_step
+                    cand_pos.append((rx, oy_ + oh)); cand_pos.append((rx, oy_ - uh))
+                for (rx, ry) in cand_pos:
+                    if (_rect_fits(free_shape, rx, ry, uw, uh) and boundary_ok(q, rx, ry, uw, uh)
+                            and required_adjacency_ok(q, rx, ry, uw, uh)):
+                        found = True
+                        break
+                if found:
+                    break
+            if not found:
+                return False
+        return True
+
     def solve(free_shape, frontier):
         nodes[0] += 1
         _check_time()
+        if not partner_space_ok(free_shape):
+            return False
+        if not wall_corner_ok(free_shape):
+            return False
         remaining = remaining_ids()
-        if (interior_grid and remaining and all(i in interior for i in remaining)
+        if (remaining and all(i in interior for i in remaining)
                 and all(b in placements for b in border_ids)):
             # every boundary rect is down: free space still touching the plot
             # boundary can never be filled by interior rects
-            if any(c.area > 1e-9 and c.intersects(boundary) for c in _free_space_components(free_shape)):
+            if any(_touches_boundary_edge(c) for c in _free_space_components(free_shape)):
                 return False
             return grid_fill(free_shape, remaining)
         if not remaining:
-            if hole_mode and not leftover_ok(free_shape):
+            if not leftover_ok(free_shape):
                 return False
             if collect_solutions is not None:
                 key = _layout_key(placements)
@@ -1058,30 +1113,12 @@ def _pack_once(
                 return False
             return True
 
-        active = None
-        if hole_mode and not hole_prune_ok(free_shape, remaining):
+        if not hole_prune_ok(free_shape, remaining):
             return False
-        if free_shape.geom_type != "Polygon" and not hole_mode:
-            comps = _free_space_components(free_shape)
-            if len(comps) > 1:
-                if defer_on[0] and not interior_phase():
-                    # pockets away from the plot boundary wait for the interior phase
-                    comps = [c for c in comps if c.intersects(boundary)]
-                if not comps:
-                    active = None
-                else:
-                    active = min(comps, key=lambda c: c.area)
-            if active is not None:
-                if not _region_fillable(active, remaining):
-                    return False
-                on = [f for f in frontier if _on_region(f[0], active)]
-                off = [f for f in frontier if not _on_region(f[0], active)]
-                frontier = on + off
-
-        if frontier and (active is None or _on_region(frontier[0][0], active)):
+        if frontier:
             # plain FIFO over the frontier
             (point, originator), *rest = frontier
-            candidates = [i for i in required_partners.get(originator, []) if i in remaining and interior_ready(i) and eligible(originator, i)]
+            candidates = [i for i in required_partners.get(originator, []) if i in remaining and eligible(originator, i)]
             if not candidates:
                 return solve(free_shape, rest)
             cand_opts = {i: placements_of(i, point, free_shape) for i in candidates}
@@ -1121,7 +1158,7 @@ def _pack_once(
 
                         (a, b), *rest_pairs = pending_pairs
                         rect_union = _union_is_rectangle(placements[a], placements[b])
-                        if rect_union and not rect_union_try:
+                        if rect_union:
                             # a and b join into one rectangle: no reflex
                             # corner for a third room to nestle into, so
                             # the shortcut does not apply -- the shared
@@ -1129,85 +1166,69 @@ def _pack_once(
                             return resolve_chain(rest_pairs, extra_points, cur_free)
                         common = [
                             t for t in required_partners.get(a, [])
-                            if t in required_partners.get(b, []) and t in remaining_ids() and interior_ready(t)
+                            if t in required_partners.get(b, []) and t in remaining_ids()
                             and eligible(a, t) and eligible(b, t)
                         ]
                         if not common:
                             return resolve_chain(rest_pairs, extra_points, cur_free)
 
-                        points_to_try = []
-                        points_to_try.extend(_reflex_corners(placements[a], placements[b]))
-                        for shared in _shared_corners(placements[a], placements[b]):
-                            line = _perpendicular_search_line(placements[a], placements[b], shared)
-                            if line is not None:
-                                points_to_try.extend(flush_line_points(placements[a], placements[b], line, cur_free))
-
-                        any_option = False
-                        # rectangular union: the forced placement is only an
-                        # attempt; when it fails we fall through to the
-                        # normal unforced continuation instead of declaring
-                        # a dead end
+                        forced = {}
                         for t_idx in common:
-                            for pt in points_to_try:
+                            fp = _forced_points(placements[a], placements[b], cur_free, sizes[t_idx], grid_step)
+                            if fp is not None:
+                                forced[t_idx] = fp
+                        if not forced:
+                            # nothing forced: placed later by the normal search
+                            return resolve_chain(rest_pairs, extra_points, cur_free)
+
+                        for t_idx in forced:
+                            for pt in forced[t_idx]:
                                 for (tx, ty, tw, th, t_free) in placements_of(t_idx, pt, cur_free):
                                     _check_time()
-                                    any_option = True
                                     placements[t_idx] = (tx, ty, tw, th)
                                     t_points = order_points([(p, t_idx) for p in _new_frontier_points(tx, ty, tw, th, pt, t_free)], t_free)
                                     result = resolve_chain(rest_pairs, extra_points + t_points, t_free)
                                     if result is True or result is None:
                                         return result
                                     del placements[t_idx]
-                        if rect_union:
-                            return resolve_chain(rest_pairs, extra_points, cur_free)
-                        if not any_option:
-                            return False
                         return False
 
-                    result = resolve_chain([(originator, cand)] if triangle_shortcut else [], new_points, new_free)
+                    result = resolve_chain([(originator, cand)], new_points, new_free)
                     if result is True or result is None:
                         return result
                     del placements[cand]
 
-            # every candidate failed here; if `originator` has no other
-            # pending point left, this is a verified dead end
-            still_pending_for_originator = any(o == originator for (_, o) in rest)
-            if not still_pending_for_originator and not always_skip:
-                return False
+            # every candidate failed at this entry: skip the entry (no dead-end rule;
+            # the wall-corner rule and the space check cut dead states at the top of solve)
             return solve(free_shape, rest)
 
-        # empty queue with an unplaced boundary room: dead (Lemma 2 of the proof). Boundary rooms are
-        # linked along the wall, so in any valid layout an unplaced boundary room is always reachable
-        # from a placed one through a queue entry; a fresh seed would only start a disconnected cluster.
-        if prune_empty_queue and hole_mode and placements and active is None and any(i not in interior for i in remaining):
+        # empty stack with a boundary room unplaced: not on any S-path (Lemma 2, Steps 2-6 give an
+        # entry while a boundary room is unplaced), so the branch is dead and nothing is reseeded.
+        if placements and any(i not in interior for i in remaining):
             return False
         # frontier empty: seed a fresh rectangle, point-first
-        per_point = region_seed(free_shape, active) if active is not None else seed_step(free_shape)
+        per_point = seed_step(free_shape)
         if not per_point:
             return False
-        for _deg, _score, point, tied in per_point:
+        outer_ban = set(corner_ban)
+        for entry in per_point:
+            _deg, _score, point, tied = entry[:4]
+            corner_ban.clear(); corner_ban.update(outer_ban); corner_ban.update(entry[4] if len(entry) > 4 else ())
             for seed, opts in tied:
-                if seed not in remaining_ids() or not interior_ready(seed):
+                if seed not in remaining_ids():
                     continue
                 for (rx, ry, uw, uh, new_free) in opts:
                     placements[seed] = (rx, ry, uw, uh)
                     new_points = order_points([(p, seed) for p in _new_frontier_points(rx, ry, uw, uh, point, new_free)], new_free)
-                    result = solve(new_free, new_points + (frontier if active is not None else []))
+                    result = solve(new_free, new_points)
                     if result is True or result is None:
                         return result
                     del placements[seed]
+        corner_ban.clear(); corner_ban.update(outer_ban)
         return False
 
-    found_before = len(collect_solutions) if collect_solutions is not None else 0
     try:
-        result = solve(poly, [])
-        if defer_on[0]:
-            nothing = (len(collect_solutions) == found_before) if collect_solutions is not None else (result is False)
-            if nothing and result is not True:
-                # phase 2: no border-first ordering
-                defer_on[0] = False
-                placements.clear()
-                result = solve(poly, [])
+        result = solve(_G.inside, [])
     except _SearchTimeout:
         result = None
 
@@ -1233,23 +1254,20 @@ def _layout_key(placements: Dict[int, Placement]) -> tuple:
 
 
 def verify_placements(polygon, placements) -> Tuple[int, int, int]:
-    """Returns (overlap_count, outside_boundary_count, hole_count)."""
-    boxes = [box(x, y, x + w, y + h) for x, y, w, h in placements.values()]
-    overlaps = sum(
-        1 for a in range(len(boxes)) for b in range(a + 1, len(boxes))
-        if boxes[a].intersection(boxes[b]).area > 1e-9
-    )
-    poly_shape = Polygon(polygon)
-    outside = sum(
-        1 for (x, y, w, h) in placements.values()
-        if poly_shape.intersection(box(x, y, x + w, y + h)).area < w * h - 1e-6
-    )
-    occupied = box(0, 0, 0, 0)
-    for x, y, w, h in placements.values():
-        occupied = occupied.union(box(x, y, x + w, y + h))
-    leftover = poly_shape.difference(occupied)
-    holes = len(leftover.geoms) if leftover.geom_type == "MultiPolygon" else (1 if not leftover.is_empty else 0)
-    return overlaps, outside, holes
+    """Returns (overlap_count, outside_boundary_count, hole_count), exactly, on the lattice."""
+    g = _lattice_step(polygon, {k: (w, h) for k, (_x, _y, w, h) in placements.items()})
+    _setup_grid(polygon, g)
+    masks = []
+    for (x, y, w, h) in placements.values():
+        i, j, cw, ch = _cells_of(x, y, w, h)
+        masks.append(_rm(cw, ch) << (j * _G.stride + i) if i >= 0 and j >= 0 else 1 << (10 ** 6))
+    overlaps = sum(1 for a in range(len(masks)) for b in range(a + 1, len(masks)) if masks[a] & masks[b])
+    outside = sum(1 for m in masks if m & ~_G.inside)
+    occupied = 0
+    for m in masks:
+        occupied |= m
+    leftover = _G.inside & ~occupied
+    return overlaps, outside, len(_free_space_components(leftover))
 
 
 # --------------------------------------------------------------------------
@@ -1391,6 +1409,13 @@ EXAMPLES = {
                              (13, 3), (13, 4), (13, 5), (13, 8), (13, 9), (13, 10), (13, 15), (14, 0), (14, 2), (14, 3), (14, 10), (14, 11), (14, 15), (14, 16), (15, 3), (15, 10), (16, 0), (16, 11), (16, 12), (16, 17), (17, 0), (17, 12)],
         interior=[13, 14, 15, 16],
     ),
+    11: dict(
+        # the 18-room plan with an 8x8 atrium hole; interior rooms 8, 14, 15, 17
+        polygon=[(0, 0), (40, 0), (40, 20), (20, 20), (20, 40), (0, 40)],
+        rects=dict(enumerate([(10, 10), (10, 10), (10, 5), (10, 5), (10, 5), (10, 5), (10, 10), (10, 10), (10, 5), (10, 5), (10, 5), (10, 5), (20, 6), (6, 14), (4, 6), (4, 6), (6, 6), (6, 8)])),
+        required_adjacency=[(0, 1), (0, 2), (1, 3), (2, 3), (2, 4), (3, 5), (4, 5), (4, 13), (4, 14), (5, 15), (5, 16), (6, 7), (6, 8), (6, 16), (6, 17), (7, 9), (8, 9), (8, 10), (8, 12), (8, 17), (9, 11), (10, 11), (10, 12), (12, 13), (12, 17), (13, 14), (14, 15), (15, 16), (16, 17)],
+        interior=[8, 14, 15, 17],
+    ),
 }
 
 
@@ -1474,7 +1499,6 @@ def _solve_and_report(label, polygon, rects, required_adjacency, max_solutions, 
         found0, placements0, nodes0 = pack_rectangles_frontier(
             polygon, rects,
             required_adjacency,
-            require_boundary_touch=True,
             interior_ids=interior_ids,
             time_limit=time_limit,
         )
@@ -1483,7 +1507,7 @@ def _solve_and_report(label, polygon, rects, required_adjacency, max_solutions, 
         print(f"\n  initial solve: {status}   nodes explored: {nodes0}   time: {t1 - t0:.3f}s")
         if found0 and placements0:
             overlaps0, outside0, holes0 = verify_placements(polygon, placements0)
-            poly_area0 = Polygon(polygon).area
+            poly_area0 = _poly_area(polygon)
             coverage0 = sum(w * h for _, _, w, h in placements0.values()) / poly_area0 * 100
             print(f"    coverage={coverage0:.1f}%  overlaps={overlaps0}  outside={outside0}  holes={holes0}")
     except KeyboardInterrupt:
@@ -1496,7 +1520,6 @@ def _solve_and_report(label, polygon, rects, required_adjacency, max_solutions, 
         found, solutions, nodes = pack_rectangles_frontier(
             polygon, rects,
             required_adjacency,
-            require_boundary_touch=True,
             interior_ids=interior_ids,
             time_limit=time_limit,
             collect_solutions=solutions,
@@ -1525,7 +1548,7 @@ def _solve_and_report(label, polygon, rects, required_adjacency, max_solutions, 
         print(f"  hit time_limit ({time_limit}s) before finishing -- showing {len(solutions)} of {max_solutions} "
               f"distinct solution(s) found so far (nodes explored: {nodes})")
 
-    poly_area = Polygon(polygon).area
+    poly_area = _poly_area(polygon)
     for i, sol in enumerate(solutions, start=1):
         overlaps, outside, holes = verify_placements(polygon, sol)
         coverage = sum(w * h for _, _, w, h in sol.values()) / poly_area * 100
@@ -1561,38 +1584,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-def pack_rectangles_frontier(polygon, rects, required_adjacency=None, *, time_limit=60.0, complete_pass=True, prune_empty_queue=None, **kw):
-    """Fast search followed by a complete last-resort pass.
-
-    Pass 1 is the fast search (the attached solver unchanged). A layout found
-    (True) or a timeout (None) is returned as is. If pass 1 says INFEASIBLE
-    (False) and `complete_pass` is True, pass 2 re-runs the search using only
-    steps that are necessary conditions, and ITS False is the proof:
-      * the dead-end `return False` is replaced by always skipping the point
-        (`always_skip=True`), so interior rooms always reach the grid phase;
-      * the triangle shortcut is off (`triangle_shortcut=False`), so the grid
-        phase and the frontier use no forced positions;
-      * the triangle-corner rule uses its proven form (`hole_corner_rules=False`);
-      * `exhaustive_seed=True`: the first seed tries EVERY room at one convex plot
-        vertex (pass 1 keeps only the best-scored rooms per degree level);
-      * `reflex_repeat=True`: a plot reflex vertex that was used as an anchor is
-        offered again to the placed room's other partners;
-      * `full_flush=True` (only matters if a caller re-enables the shortcut).
-    `prune_empty_queue` (default: on for plots with at most one reflex vertex): a branch whose
-    frontier is empty while a boundary room is unplaced is dead (Lemma 2); both passes use it.
-    Each pass gets `time_limit` seconds; the node count returned is the sum.
-    """
-    if prune_empty_queue is None:
-        # sound by Lemma 2 for plots with at most one reflex vertex (every L-shape); off otherwise
-        prune_empty_queue = len(_polygon_reflex_vertices(polygon)) <= 1
-    kw['prune_empty_queue'] = prune_empty_queue
-    found, placements, nodes = _pack_once(polygon, rects, required_adjacency,
-                                          time_limit=time_limit, **kw)
-    if found is not False or not complete_pass:
-        return found, placements, nodes
-    kw2 = dict(kw)
-    kw2.update(full_flush=True, always_skip=True, triangle_shortcut=False, hole_corner_rules=False, reflex_repeat=True, exhaustive_seed=True)
-    found2, placements2, nodes2 = _pack_once(polygon, rects, required_adjacency,
-                                             time_limit=time_limit, **kw2)
-    return found2, placements2, nodes + nodes2

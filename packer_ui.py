@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Local web UI for ptpg_with_interior_hole.py.
+"""Local web UI for ptpg_with_interior_hole.py (the solver the completeness proof is about).
 
     python packer_ui.py            # then open http://localhost:8765
     python packer_ui.py --port 9000
 
-Needs only the solver file next to it (plus shapely, which the solver needs).
+Needs the solver file ptpg_with_interior_hole.py next to it (shapely is used only to draw the hole).
 Enter the plot, the rooms, the adjacencies and the interior rooms, press Run.
 """
 import argparse
@@ -72,6 +72,14 @@ def validate(poly, rects, adj, interior):
                 errs.append(msg)
         if interior and len(interior) == len(rects):
             errs.append("At least one room must touch the plot boundary.")
+    if not errs:
+        # the claim of the proof: rectangle or L-shape, inputs on a lattice of step >= 1/1000
+        if len(rp._polygon_reflex_vertices(poly)) > 1:
+            errs.append("The plot may have at most one inward (reflex) corner: a rectangle or an L-shape.")
+        try:
+            rp._lattice_step(poly, rects)
+        except ValueError as ex:
+            errs.append(str(ex))
     return errs, warns, info
 
 
@@ -81,7 +89,6 @@ def solve(data):
     adj = {tuple(sorted((int(a), int(b)))) for a, b in data["adjacency"]}
     interior = {int(i) for i in data.get("interior", [])}
     tl = float(data.get("time_limit", 30))
-    kw = {k: bool(v) for k, v in (data.get("options") or {}).items()}
 
     errs, warns, info = validate(poly, rects, adj, interior)
     if errs:
@@ -89,7 +96,7 @@ def solve(data):
 
     t0 = time.time()
     found, sol, nodes = rp.pack_rectangles_frontier(
-        poly, rects, adj, interior_ids=interior, time_limit=tl, **kw)
+        poly, rects, adj, interior_ids=interior, time_limit=tl)
     dt = time.time() - t0
     out = {"status": {True: "solved", False: "none", None: "timeout"}[found],
            "nodes": nodes, "seconds": round(dt, 2), "info": info}
@@ -440,7 +447,7 @@ function resultHtml(r){
   return `<div class="msg ok"><b>Layout found.</b> Checked: ${v.overlaps} overlaps, ${v.outside} outside the plot, ${v.holes} extra holes.</div>`+stats+drawResult(res,p,r.n)+
    `<div class="mut" style="margin-top:6px">Blue = ordinary room, orange = interior room, hatched = hole.</div>`}
  if(res.status==="none")
-  return `<div class="msg warn"><b>No layout found.</b> The search finished without one. This is very likely infeasible, but a “no” is not a proof: the corner rules and pruning are heuristics.</div>`+stats;
+  return `<div class="msg warn"><b>No valid layout exists.</b> The search ran to completion and covered every case, so this answer is exact (rectangle or L-shaped plot, inputs on the lattice the solver accepts; see the completeness proof).</div>`+stats;
  return `<div class="msg warn"><b>Timed out</b> after ${res.seconds}s. Undecided. Try a longer time limit.</div>`+stats;
 }
 function runHtml(r){
