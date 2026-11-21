@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Local web UI for ptpg_with_interior_hole.py (the solver the completeness proof is about).
+"""Local web UI for ptpg.py.
 
     python packer_ui.py            # then open http://localhost:8765
     python packer_ui.py --port 9000
 
-Needs the solver file ptpg_with_interior_hole.py next to it (shapely is used only to draw the hole).
+Needs the solver file ptpg.py next to it (shapely is used for the independent check and to draw the unused space).
 Enter the plot, the rooms, the adjacencies and the interior rooms, press Run.
 """
 import argparse
 import json
 import multiprocessing as mp
 import os
+import signal
 import threading
 import time
 import uuid
@@ -19,7 +20,7 @@ from urllib.parse import parse_qs, urlparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-import ptpg_with_interior_hole as rp
+import ptpg as rp
 from shapely.geometry import Polygon, box
 from shapely.ops import unary_union
 
@@ -67,17 +68,25 @@ def validate(poly, rects, adj, interior):
             elif total < info["plot_area"] - 1e-9:
                 info["hole_area"] = info["plot_area"] - total
         if len(rects) > 1:
-            ok, msg = rp.check_no_isolated(rects, set(adj), set(interior))
-            if not ok:
-                errs.append(msg)
-        if interior and len(interior) == len(rects):
-            errs.append("At least one room must touch the plot boundary.")
+            deg = {i: 0 for i in rects}
+            for (x, y) in adj:
+                if x in deg and y in deg:
+                    deg[x] += 1
+                    deg[y] += 1
+            lone = [i for i, d in deg.items() if d == 0]
+            if lone:
+                warns.append(f"Room(s) {', '.join(map(str, lone))} have no required neighbour. They may float anywhere "
+                             "that touches no other room, which can make the search slow.")
+        for i in interior:
+            if i not in rects:
+                errs.append(f"Interior room {i} does not exist.")
     if not errs:
-        # the claim of the proof: rectangle or L-shape, inputs on a lattice of step >= 1/1000
-        if len(rp._polygon_reflex_vertices(poly)) > 1:
-            errs.append("The plot may have at most one inward (reflex) corner: a rectangle or an L-shape.")
+        if any(abs(v - round(v)) > 1e-9 for w, h in rects.values() for v in (w, h)) or \
+           any(abs(c - round(c)) > 1e-9 for p in poly for c in p):
+            warns.append("The solver places rooms on whole units. With non-integer sizes a layout that needs a "
+                         "fractional offset can be missed, so 'no layout' is only exact for whole-unit positions.")
         try:
-            rp._lattice_step(poly, rects)
+            rp._lattice(poly, rects)
         except ValueError as ex:
             errs.append(str(ex))
     return errs, warns, info
@@ -95,19 +104,18 @@ def solve(data):
         return {"status": "invalid", "errors": errs}
 
     t0 = time.time()
-    found, sol, nodes = rp.pack_rectangles_frontier(
-        poly, rects, adj, interior_ids=interior, time_limit=tl)
+    found, sol, nodes = rp.pack_cluster(poly, rects, sorted(adj), interior_ids=interior, time_limit=tl)
     dt = time.time() - t0
     out = {"status": {True: "solved", False: "none", None: "timeout"}[found],
            "nodes": nodes, "seconds": round(dt, 2), "info": info}
     if found:
         out["placements"] = {str(i): list(map(float, p)) for i, p in sol.items()}
-        ov, outside, holes = rp.verify_placements(poly, sol)
-        out["verify"] = {"overlaps": ov, "outside": outside, "holes": holes}
+        v = rp._verify(poly, sol, rects, sorted(adj), interior) or (0, 0, 0, 0)
+        out["verify"] = {"overlaps": v[0], "outside": v[1], "wrong_adj": v[2], "int_touch": v[3]}
         left = Polygon(poly).difference(unary_union(
             [box(x, y, x + w, y + h) for x, y, w, h in sol.values()]))
-        geoms = list(left.geoms) if left.geom_type == "MultiPolygon" else [left]
-        out["hole"] = [list(g.exterior.coords) for g in geoms if g.area > 1e-9]
+        geoms = list(left.geoms) if left.geom_type in ("MultiPolygon", "GeometryCollection") else [left]
+        out["hole"] = [list(g.exterior.coords) for g in geoms if g.geom_type == "Polygon" and g.area > 1e-9]
     return out
 
 
@@ -122,6 +130,14 @@ MAX_RUNNING = max(2, os.cpu_count() or 2)
 
 
 def _worker(data, conn):
+    def _die(*_):
+        for c in mp.active_children():
+            c.terminate()
+        os._exit(0)
+    try:
+        signal.signal(signal.SIGTERM, _die)
+    except (ValueError, AttributeError, OSError):
+        pass
     try:
         conn.send(solve(data))
     except Exception as ex:
@@ -137,7 +153,7 @@ def start_job(data):
         if running >= MAX_RUNNING:
             return {"errors": [f"{running} runs are already going. Stop one or wait for it to finish."]}
         parent, child = mp.Pipe(False)
-        proc = mp.Process(target=_worker, args=(data, child), daemon=True)
+        proc = mp.Process(target=_worker, args=(data, child))  # not daemon: the solver starts its own helper processes
         proc.start()
         child.close()
         jid = uuid.uuid4().hex[:10]
@@ -203,6 +219,7 @@ class Handler(BaseHTTPRequestHandler):
                     "rects": {str(i): list(v) for i, v in e["rects"].items()},
                     "adjacency": [list(a) for a in (e.get("required_adjacency") or [])],
                     "interior": list(e.get("interior", ())),
+                    "labels": {str(i): n for i, n in (e.get("labels") or {}).items()},
                 }
             self._send(200, json.dumps(ex))
         else:
@@ -294,7 +311,7 @@ details summary{cursor:pointer;color:var(--mut);font-size:13px}.opts label{displ
  <section><h2>2 · Rooms <span><span class="mut" id="roomArea"></span> <button class="ghost" id="addRoom">+ add room</button></span></h2>
   <div style="overflow-x:auto"><table id="rooms"><thead></thead><tbody></tbody></table></div>
   <div class="row"><b>Add a room:</b> <label>width <input type="number" id="qw" value="3" min="0" step="any" style="width:60px"></label> <label>height <input type="number" id="qh" value="3" min="0" step="any" style="width:60px"></label> <label>copies <input type="number" id="qn" value="1" min="1" style="width:50px"></label> <button id="qadd">Add</button></div>
-  <div class="mut">Tick a box if the room in that row and the room in that column must share a wall (ticks are mirrored). Unticked pairs must NOT touch. Rooms may be rotated. "Interior" = touches the plot boundary nowhere.</div>
+  <div class="mut">Tick a box if the room in that row and the room in that column must share a wall (ticks are mirrored). Unticked pairs must NOT touch. Rooms may be rotated. "Interior" = touches the plot boundary nowhere, not even at a corner. Other rooms may or may not touch it. Leftover space can be any shape.</div>
  </section>
 
  <section><h2>Run</h2>
@@ -413,10 +430,25 @@ function changed(){
 async function check(){
  let r;try{r=await (await fetch("/validate",{method:"POST",body:JSON.stringify(payload())})).json()}catch(e){return}
  let h="";(r.errors||[]).forEach(e=>h+=`<div class="msg bad">${esc(e)}</div>`);
+ (r.warnings||[]).forEach(e=>h+=`<div class="msg warn">${esc(e)}</div>`);
  if(!(r.errors||[]).length){const i=r.info||{};
-  h+=`<div class="msg ok">Input looks valid.${i.hole_area?` Rooms leave an interior hole of area ${+i.hole_area.toFixed(4)}.`:" The rooms fill the plot exactly."}</div>`}
+  h+=`<div class="msg ok">Input looks valid.${i.hole_area?` Rooms leave unused area ${+i.hole_area.toFixed(4)}.`:" The rooms fill the plot exactly."}</div>`}
  $("problems").innerHTML=h;$("run").dataset.bad=(r.errors||[]).length?1:"";
 }
+function fitLabel(x,y,w,h,txt,cap){
+ const dims=+(+w).toFixed(2)+"\u00d7"+ +(+h).toFixed(2);
+ txt=String(txt);const words=txt.split(/\s+/).filter(Boolean);let best=null;
+ for(let n=1;n<=Math.max(1,txt.length);n++){
+  const lines=[];let cur="";
+  for(const wd of words){if(cur&&(cur+" "+wd).length>n){lines.push(cur);cur=wd}else cur=cur?cur+" "+wd:wd}
+  if(cur)lines.push(cur);
+  lines.push(dims);
+  const L=Math.max(...lines.map(l=>l.length));
+  const f=Math.min(cap,w*.84/(L*.62),h*.85/(lines.length*1.15));
+  if(!best||f>best.f)best={f,lines}
+ }
+ const f=best.f,k=best.lines.length,cx=x+w/2,cy=-(y+h/2);
+ return `<text font-size="${f}" text-anchor="middle" fill="var(--ink)" font-weight="600">`+best.lines.map((l,j)=>`<tspan x="${cx}" y="${cy+(j-(k-1)/2)*1.15*f}" dominant-baseline="central">${esc(l)}</tspan>`).join("")+`</text>`}
 function drawResult(res,p,uid){
  const poly=p.polygon;
  const xs=poly.map(q=>q[0]),ys=poly.map(q=>q[1]);const mx=Math.min(...xs),Mx=Math.max(...xs),my=Math.min(...ys),My=Math.max(...ys);
@@ -427,7 +459,7 @@ function drawResult(res,p,uid){
  const pl=p,inter=new Set(pl.interior);
  for(const[i,[x,y,w,h]]of Object.entries(res.placements)){
   g+=`<rect x="${x}" y="${-(y+h)}" width="${w}" height="${h}" fill="${inter.has(+i)?"var(--int)":"var(--room)"}" stroke="var(--ink)" stroke-width="${s/8}"/>`+
-     `<text x="${x+w/2}" y="${-(y+h/2)}" font-size="${Math.min(s*1.3,Math.min(w,h)*.6,w*1.7/Math.max(1,String(pl.labels[i]||i).length*.6*1.7))}" text-anchor="middle" dominant-baseline="central" fill="var(--ink)" font-weight="600">${esc(pl.labels[i]||i)}</text>`}
+     fitLabel(x,y,w,h,pl.labels[i]||i,s*1.3)}
  return g.replace("<svg ",`<svg `)+`<defs><pattern id="hatch${uid}" width="${s}" height="${s}" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="${s}" stroke="var(--mut)" stroke-width="${s/10}"/></pattern></defs></svg>`;
 }
 let runs=[],runSeq=0,poller=null,lockT=null;
@@ -444,10 +476,10 @@ function resultHtml(r){
  if(res.status==="invalid")return res.errors.map(e=>`<div class="msg bad">${esc(e)}</div>`).join("");
  const stats=`<div class="stats"><div><b>${res.seconds}s</b>time</div><div><b>${res.nodes}</b>search nodes</div></div>`;
  if(res.status==="solved"){const v=res.verify;
-  return `<div class="msg ok"><b>Layout found.</b> Checked: ${v.overlaps} overlaps, ${v.outside} outside the plot, ${v.holes} extra holes.</div>`+stats+drawResult(res,p,r.n)+
-   `<div class="mut" style="margin-top:6px">Blue = ordinary room, orange = interior room, hatched = hole.</div>`}
+  return `<div class="msg ok"><b>Layout found.</b> Checked: ${v.overlaps} overlaps, ${v.outside} outside the plot, ${v.wrong_adj} wrong touch/no-touch pairs, ${v.int_touch} interior rooms touching the wall.</div>`+stats+drawResult(res,p,r.n)+
+   `<div class="mut" style="margin-top:6px">Blue = ordinary room, orange = interior room, hatched = unused space.</div>`}
  if(res.status==="none")
-  return `<div class="msg warn"><b>No valid layout exists.</b> The search ran to completion and covered every case, so this answer is exact (rectangle or L-shaped plot, inputs on the lattice the solver accepts; see the completeness proof).</div>`+stats;
+  return `<div class="msg warn"><b>No valid layout exists.</b> The search ran to completion and covered every case (rooms placed on whole units).</div>`+stats;
  return `<div class="msg warn"><b>Timed out</b> after ${res.seconds}s. Undecided. Try a longer time limit.</div>`+stats;
 }
 function runHtml(r){

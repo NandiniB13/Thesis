@@ -1,924 +1,746 @@
 """
-Exact backtracking packer: places rectangles inside a rectilinear polygon
-plot with no overlaps and no rectangle crossing the boundary.
+Exact rectangle packer for rectilinear plots.
 
-`pack_rectangles_frontier` is the sole solver: a PTPG-driven frontier
-search built around `required_adjacency` (a set of (id_a, id_b) pairs
-over the same keys as `rects`, e.g. from a planar adjacency graph of
-which rooms must touch). It grows outward from placed rectangles using
-that graph to decide what to try next, instead of rescanning the whole
-free boundary each step; see the "Frontier / PTPG-driven search" section
-below.
+Problem: place axis-aligned rectangular rooms (each may be rotated) in a rectilinear plot so that
+  * rooms lie inside the plot and have disjoint interiors,
+  * two rooms touch (share a segment of positive length) exactly when their pair is required,
+  * rooms in `interior_ids` do not touch the plot boundary at all (not even at a point),
+  * every other room may or may not touch the boundary,
+  * the leftover space is arbitrary (any shape, any number of pieces).
+Positions are whole units: the grid step is min(1, gcd of the plot coordinates and room sides).
 
-Every candidate is anchored at a live vertex of the current free
-polygon, and every placed rectangle must touch the plot boundary along
-part of one edge (`require_boundary_touch`). A placement is rejected if
-it fragments the remaining free space into more pieces than the
-remaining rects can close, either by exact tiling or by being set aside
-as the one leftover hole `require_single_hole` allows (see
-`_fill_pockets_shortcut`). The final touch-graph must match
-`required_adjacency` exactly, checked incrementally as each rect is
-placed.
-
-Rectangles are identified by explicit ids (`rects` is {id: (w, h)}), the
-same ids used in `placements` and `required_adjacency`.
-
-Multi-solution mode
---------------------
-Passing `collect_solutions` (a list) keeps the search going after each
-valid packing instead of stopping at the first one, returning several
-distinct layouts (deduplicated by geometry).
+pack_cluster places rooms in free coordinates, each touching a room already placed, and keeps the set of
+plot translations under which all placed rooms still fit (the plot is allowed to move).
+It returns (found, placements, nodes); found is True / False / None (time limit).
+With no time limit, False means that no valid layout exists.
 """
-import ast
 import time
-from typing import Dict, Iterable, List, Optional, Tuple
-
-from shapely.geometry import LineString, Point, Polygon, box
-from shapely.geometry.base import BaseGeometry
-
-
-class _SearchTimeout(Exception):
-    """Raised by `_check_time` once `time_limit` is exceeded; caught once
-    at the bottom of `pack_rectangles_frontier` for an immediate abort."""
-
-Size = Tuple[float, float]
-Placement = Tuple[float, float, float, float]
+from fractions import Fraction
+from math import gcd
+from typing import Dict, Iterable, Optional
 
 
-# --------------------------------------------------------------------------
-# Geometry helpers
-# --------------------------------------------------------------------------
-
-def _polygon_vertices(shape: BaseGeometry) -> List[Tuple[float, float]]:
-    polys = list(shape.geoms) if shape.geom_type == "MultiPolygon" else [shape]
-    pts = set()
-    for p in polys:
-        if p.is_empty:
-            continue
-        pts.update(p.exterior.coords[:-1])
-        for interior in p.interiors:
-            pts.update(interior.coords[:-1])
-    return list(pts)
+class _Timeout(Exception):
+    pass
 
 
-def _polygon_reflex_vertices(polygon: List[Tuple[float, float]], tol: float = 1e-9) -> set:
-    """Concave (reflex) vertices of the plot boundary, e.g. the inner
-    corner(s) of an L-shaped plot. Handles either winding order via the
-    polygon's signed area."""
-    n = len(polygon)
-    if n < 4:
-        return set()
-    area2 = sum(
-        polygon[i][0] * polygon[(i + 1) % n][1] - polygon[(i + 1) % n][0] * polygon[i][1]
-        for i in range(n)
-    )
-    ccw = area2 > 0
-    out = set()
-    for i in range(n):
-        ax, ay = polygon[i - 1]
-        bx, by = polygon[i]
-        cx, cy = polygon[(i + 1) % n]
-        cross = (bx - ax) * (cy - by) - (by - ay) * (cx - bx)
-        is_reflex = (cross < -tol) if ccw else (cross > tol)
-        if is_reflex:
-            out.add((bx, by))
-    return out
+def _lattice(polygon, sizes):
+    vals = [abs(c) for p in polygon for c in p] + [s for wh in sizes.values() for s in wh]
+    if any(v > 1000 for v in vals) or any(s <= 0 for wh in sizes.values() for s in wh):
+        raise ValueError("coordinates must be at most 1000 in absolute value and room sides positive")
+    fr = []
+    for v in [c for p in polygon for c in p] + [s for wh in sizes.values() for s in wh]:
+        f = Fraction(v).limit_denominator(1000)
+        if abs(float(f) - v) > 1e-11:
+            raise ValueError("a coordinate is not within 1e-11 of a rational with denominator <= 1000")
+        fr.append(f)
+    den = 1
+    for f in fr:
+        den = den * f.denominator // gcd(den, f.denominator)
+    nums = [int(f * den) for f in fr]
+    g = 0
+    for n in nums:
+        g = gcd(g, abs(n))
+    return Fraction(g, den), den
 
 
-def _rect_fits(free_shape: BaseGeometry, candidate: BaseGeometry) -> bool:
-    if free_shape.is_empty:
-        return False
-    # cheap bbox reject before the expensive shapely intersection
-    fminx, fminy, fmaxx, fmaxy = free_shape.bounds
-    cminx, cminy, cmaxx, cmaxy = candidate.bounds
-    if cminx < fminx - 1e-9 or cminy < fminy - 1e-9 or cmaxx > fmaxx + 1e-9 or cmaxy > fmaxy + 1e-9:
-        return False
-    return abs(free_shape.intersection(candidate).area - candidate.area) < 1e-6
+class _Budget(Exception):
+    pass
 
 
-def _shares_boundary_edge(rx: float, ry: float, w: float, h: float, boundary, tol: float = 1e-9) -> bool:
-    """True if any edge of the rectangle overlaps the plot boundary by more than a point."""
-    edges = [
-        LineString([(rx, ry), (rx + w, ry)]),
-        LineString([(rx, ry + h), (rx + w, ry + h)]),
-        LineString([(rx, ry), (rx, ry + h)]),
-        LineString([(rx + w, ry), (rx + w, ry + h)]),
-    ]
-    return any(edge.length >= tol and edge.intersection(boundary).length > tol for edge in edges)
-
-
-def _rects_touch(a: Placement, b: Placement, tol: float = 1e-9) -> bool:
-    """True if two axis-aligned placed rectangles share a positive-length edge."""
-    ax, ay, aw, ah = a
-    bx, by, bw, bh = b
-    if abs((ax + aw) - bx) < tol or abs((bx + bw) - ax) < tol:
-        overlap = min(ay + ah, by + bh) - max(ay, by)
-        if overlap > tol:
-            return True
-    if abs((ay + ah) - by) < tol or abs((by + bh) - ay) < tol:
-        overlap = min(ax + aw, bx + bw) - max(ax, bx)
-        if overlap > tol:
-            return True
-    return False
-
-
-def _num_components(shape: BaseGeometry, robust_tol: float = 1e-4) -> int:
-    """Connected pieces of free space, robust to hairline slivers from float noise."""
-    if shape.is_empty:
-        return 0
-    eroded = shape.buffer(-robust_tol)
-    if eroded.is_empty:
-        return 0
-    return len(eroded.geoms) if eroded.geom_type == "MultiPolygon" else 1
-
-
-def _free_space_components(shape: BaseGeometry):
-    """Connected pieces of free space (exact boundaries), largest first."""
-    if shape.is_empty:
-        return []
-    comps = list(shape.geoms) if shape.geom_type == "MultiPolygon" else [shape]
-    return sorted(comps, key=lambda c: -c.area)
-
-
-_ORIENTATION_OFFSETS = [(0, 0), (-1, 0), (0, -1), (-1, -1)]  # multiplied by (w, h) per call
-
-
-def _candidate_offsets(w, h):
-    return [(ox * w, oy * h) for ox, oy in _ORIENTATION_OFFSETS]
-
-
-# --------------------------------------------------------------------------
-# Frontier / PTPG-driven search
-#
-# Grows outward from placed rectangles using the PTPG graph to decide what
-# to try next, instead of rescanning the whole free boundary each step:
-#
-#  1. Seed: pick a rectangle via whole-boundary MRV, place it at one of
-#     its live boundary anchor points.
-#  2. That placement exposes at most 2 new anchor points (its corners
-#     adjacent to the anchor, excluding the diagonal). At each, only
-#     rects required to be adjacent to the exposing rect are considered,
-#     ranked by local MRV.
-#  3. Triangle shortcut: whenever the rect just placed and the rect that
-#     exposed its anchor point share a common required partner, that
-#     partner is placed mandatorily at the reflex corner of their L-union
-#     (or, if they meet corner-to-corner, along the shared perpendicular
-#     line). If no orientation fits or passes boundary-touch, the whole
-#     placement backtracks.
-#  4. Continues growing the frontier this way; once it's exhausted, a
-#     fresh rectangle is seeded via step 1.
-# --------------------------------------------------------------------------
-
-def _point_on_rect_edge(vx: float, vy: float, rx: float, ry: float, w: float, h: float, tol: float = 1e-9) -> bool:
-    """True if (vx, vy) lies anywhere along one of the rect's 4 edges."""
-    on_vert_edge = (abs(vx - rx) < tol or abs(vx - rx - w) < tol) and ry - tol <= vy <= ry + h + tol
-    on_horiz_edge = (abs(vy - ry) < tol or abs(vy - ry - h) < tol) and rx - tol <= vx <= rx + w + tol
-    return on_vert_edge or on_horiz_edge
-
-
-def _new_frontier_points(rx, ry, w, h, used_point, free_shape=None):
-    """The rectangle's exposed corners for further growth: the 2 corners
-    adjacent to the one it was anchored at, plus the diagonal corner if
-    `free_shape` is given and that corner is still a live vertex (the
-    triangle shortcut anchors at reflex corners, where the diagonal can
-    stay exposed). Also, when `free_shape` is given, any other live
-    vertex lying along this rect's own edges (not one of its 4 corners) --
-    e.g. a plot reflex corner sitting partway along the edge, which is a
-    valid anchor for a required partner touching both boundary and rect."""
-    corners = [(rx, ry), (rx + w, ry), (rx, ry + h), (rx + w, ry + h)]
-    px, py = used_point
-    adjacent = [
-        c for c in corners
-        if not (abs(c[0] - px) < 1e-9 and abs(c[1] - py) < 1e-9)
-        and (abs(c[0] - px) < 1e-9 or abs(c[1] - py) < 1e-9)
-    ]
-    if free_shape is None:
-        return adjacent
-    diagonal = next(
-        c for c in corners
-        if abs(c[0] - px) > 1e-9 and abs(c[1] - py) > 1e-9
-    )
-    live_verts = _polygon_vertices(free_shape)
-    result = list(adjacent)
-    if any(abs(diagonal[0] - vx) < 1e-9 and abs(diagonal[1] - vy) < 1e-9 for (vx, vy) in live_verts):
-        result.append(diagonal)
-    for (vx, vy) in live_verts:
-        if any(abs(vx - cx) < 1e-9 and abs(vy - cy) < 1e-9 for (cx, cy) in corners):
-            continue
-        if _point_on_rect_edge(vx, vy, rx, ry, w, h):
-            result.append((vx, vy))
-    return result
-
-
-def _reflex_corner(box_a: Placement, box_b: Placement):
-    """The inner (concave) corner of the L-union of two touching,
-    perpendicular rectangles. None if they're collinear (no reflex corner)."""
-    x1, y1, w1, h1 = box_a
-    x2, y2, w2, h2 = box_b
-    xs = [x1, x1 + w1, x2, x2 + w2]
-    ys = [y1, y1 + h1, y2, y2 + h2]
-    xmin, xmax = min(xs), max(xs)
-    ymin, ymax = min(ys), max(ys)
-    corners = {
-        (x1, y1), (x1 + w1, y1), (x1, y1 + h1), (x1 + w1, y1 + h1),
-        (x2, y2), (x2 + w2, y2), (x2, y2 + h2), (x2 + w2, y2 + h2),
-    }
-    for (cx, cy) in corners:
-        if xmin + 1e-9 < cx < xmax - 1e-9 and ymin + 1e-9 < cy < ymax - 1e-9:
-            return (cx, cy)
-    return None
-
-
-def _shared_corners(box_a: Placement, box_b: Placement, tol: float = 1e-9):
-    """Points that are a corner of both box_a and box_b -- non-empty only
-    when the two meet exactly corner-to-corner (flush along their touching
-    edge) at one or both ends. Equal-sized touching edges are flush at
-    both ends, giving two distinct shared corners."""
-    x1, y1, w1, h1 = box_a
-    x2, y2, w2, h2 = box_b
-    corners_a = {(x1, y1), (x1 + w1, y1), (x1, y1 + h1), (x1 + w1, y1 + h1)}
-    corners_b = {(x2, y2), (x2 + w2, y2), (x2, y2 + h2), (x2 + w2, y2 + h2)}
-    out = []
-    for ca in corners_a:
-        for cb in corners_b:
-            if abs(ca[0] - cb[0]) < tol and abs(ca[1] - cb[1]) < tol:
-                out.append(ca)
-    return out
-
-
-def _perpendicular_search_line(box_a: Placement, box_b: Placement, shared_corner, tol: float = 1e-6):
-    """When two rects meet exactly at a shared corner, the axis they
-    DON'T touch along, at the shared corner's coordinate, is a line both
-    rects lie flush on -- a third rect touching both can anchor anywhere
-    on it. Returns (axis, value), or None if they don't touch along a
-    positive-length edge."""
-    ax, ay, aw, ah = box_a
-    bx, by, bw, bh = box_b
-    x_overlap = min(ax + aw, bx + bw) - max(ax, bx)
-    y_overlap = min(ay + ah, by + bh) - max(ay, by)
-    if abs(x_overlap) < tol and y_overlap > tol:
-        return ("y", shared_corner[1])
-    if abs(y_overlap) < tol and x_overlap > tol:
-        return ("x", shared_corner[0])
-    return None
-
-
-def _anchor_points_on_line(free_shape, axis: str, value: float, tol: float = 1e-6):
-    """Live vertices of the free polygon lying on x=value or y=value."""
-    verts = _polygon_vertices(free_shape)
-    idx = 0 if axis == "x" else 1
-    return [p for p in verts if abs(p[idx] - value) < tol]
-
-
-def pack_rectangles_frontier(
-    polygon,
-    rects: Dict[int, Size],
-    required_adjacency=None,
-    *,
-    require_single_hole: bool = True,
-    require_boundary_touch: bool = True,
-    time_limit: Optional[float] = 60.0,
-    collect_solutions: Optional[list] = None,
-    max_solutions: Optional[int] = None,
-):
-    """PTPG-driven frontier search. Returns (found, placements_or_None,
-    nodes_explored). found is True / False / None (feasible / proven
-    infeasible / cut off by time_limit).
-
-    `time_limit` (seconds, wall-clock; None = unbounded) is checked via
-    `_check_time` in every hot loop, not just `solve()`, since real work
-    (a vertex scan, `_tile_pocket`'s own search) can happen without
-    calling `solve()` again in between. Exceeding it raises
-    `_SearchTimeout`, caught once at the bottom of this function.
-
-    `required_adjacency` (an iterable of (id_a, id_b) pairs over the same
-    ids as `rects`) is optional -- `None`/`[]` means no adjacency
-    constraint (every rect is its own region, re-seeded independently;
-    `require_single_hole`/`require_boundary_touch` still apply).
-
-    Pass `collect_solutions` (a list) to keep searching past the first
-    valid placement: each is appended and the search backtracks for a
-    genuinely different one, up to `max_solutions` (None = exhaustive).
-    In this mode the second return value is always `collect_solutions`
-    itself."""
-    sizes = dict(rects)
-    boundary = Polygon(polygon).boundary
-    poly = Polygon(polygon)
-    inner_l_points = _polygon_reflex_vertices(polygon)
-    required_adjacency = required_adjacency or []
-
-    seen_layouts = {_layout_key(sol) for sol in collect_solutions} if collect_solutions else set()
-
-    required_partners: Dict[int, List[int]] = {i: [] for i in sizes}
-    for a, b in required_adjacency:
-        if a == b:
-            raise ValueError(f"required_adjacency has a self-pair: ({a!r}, {a!r})")
-        if a not in sizes or b not in sizes:
-            raise ValueError(f"required_adjacency references an unknown rect id ({a!r}, {b!r})")
-        if b not in required_partners[a]:
-            required_partners[a].append(b)
-        if a not in required_partners[b]:
-            required_partners[b].append(a)
-
-    # A rect with exactly 2 required partners who are themselves required
-    # partners of each other (a triangle in the adjacency graph) must sit
-    # at the reflex/convex corner of that pair's L-union -- it has nowhere
-    # else it could go. Sufficient, not necessary, for being a "corner"
-    # rect (plenty of real corners aren't degree-2 triangles), so this is
-    # only used to try these rects earlier in `seed_step`, not as a filter.
-    triangle_corner_ids = {
-        i for i, ps in required_partners.items()
-        if len(ps) == 2 and ps[1] in required_partners.get(ps[0], [])
-    }
-
-    placements: Dict[int, Placement] = {}
+def _cluster_search(polygon, rects: Dict[int, tuple], required_adjacency=None, *,
+                    interior_ids: Iterable[int] = (), t_end=None, rule="mrv", node_budget=None,
+                    on_solution=None, per_arrangement=4):
+    """One complete cluster-first search. rule = "mrv": next room = fewest legal positions;
+    rule = "area": fewest legal positions per unit of the room's area. Returns (found, placements, nodes)
+    with found True / False / None (time ran out) / "budget" (node_budget used up, nothing decided)."""
     nodes = [0]
-    deadline = time.perf_counter() + time_limit if time_limit is not None else None
+    ids = list(rects)
+    interior = set(interior_ids)
+    partners = {i: set() for i in ids}
+    for a, b in (required_adjacency or ()):
+        if a == b or a not in partners or b not in partners:
+            raise ValueError("bad required pair")
+        partners[a].add(b)
+        partners[b].add(a)
 
-    def _check_time():
-        if deadline is not None and time.perf_counter() > deadline:
-            raise _SearchTimeout()
+    g, den = _lattice(polygon, rects)
+    g = min(g, Fraction(1))
+    sc = lambda v: int(round(Fraction(v).limit_denominator(1000) / g))
+    poly = [(sc(x), sc(y)) for x, y in polygon]
+    x0 = min(p[0] for p in poly)
+    y0 = min(p[1] for p in poly)
+    poly = [(x - x0, y - y0) for x, y in poly]
+    size = {i: (sc(rects[i][0]), sc(rects[i][1])) for i in ids}
+    W = max(p[0] for p in poly)
+    H = max(p[1] for p in poly)
+    n = len(poly)
+    for k in range(n):
+        (ax, ay), (bx, by) = poly[k], poly[(k + 1) % n]
+        if ax != bx and ay != by:
+            raise ValueError("the plot must be rectilinear")
 
-    # The one pocket (if any) this branch has set aside as the final
-    # leftover hole `require_single_hole` allows -- see
-    # `_fill_pockets_shortcut`. Reset to None whenever that choice is undone.
-    hole_geom = [None]
+    # ---- cells of the plot (stride W) -----------------------------------------------------------
+    inside = 0
+    for j in range(H):
+        yc2 = 2 * j + 1
+        cross = sorted(poly[k][0] for k in range(n)
+                       if poly[k][0] == poly[(k + 1) % n][0]
+                       and 2 * min(poly[k][1], poly[(k + 1) % n][1]) < yc2 < 2 * max(poly[k][1], poly[(k + 1) % n][1]))
+        for a in range(0, len(cross) - 1, 2):
+            for i in range(cross[a], cross[a + 1]):
+                inside |= 1 << (j * W + i)
+    if sum(size[i][0] * size[i][1] for i in ids) > bin(inside).count("1"):
+        return False, None, 0
+    ones = [0] * (H + 3)
+    for h in range(1, H + 3):
+        ones[h] = ones[h - 1] | (1 << (W * (h - 1)))
+    rmask = lambda x, y, w, h: (((1 << w) - 1) * ones[h]) << (y * W + x)
 
-    def required_adjacency_ok(idx, rx, ry, w, h) -> bool:
-        cand = (rx, ry, w, h)
-        partners = required_partners[idx]
-        for j, placed in placements.items():
-            if _rects_touch(cand, placed) != (j in partners):
-                return False
-        return True
+    # ---- translation masks ------------------------------------------------------------------------
+    S = 2 * W + 1                               # stride of the translation grid; u = plot position of the seed room,
+    full = 0                                    # so only ux in [0, W), uy in [0, H) matter (columns >= W absorb the wrap)
+    for uy in range(H):
+        full |= ((1 << W) - 1) << (uy * S)
+    Vcache = {}
 
-    def single_hole_ok(new_free) -> bool:
-        """Cheap necessary pre-filter, not the real tiling check: a
-        placement that splits off pockets is still viable if each pocket
-        can be exactly tiled by the remaining rects (see `_tile_pocket`).
-        Running that real search here would be paid on every candidate
-        examined anywhere in the outer search, so this only checks area
-        and minimum-dimension feasibility; the sufficient check is
-        deferred to `_fill_pockets_shortcut`, run once a placement is
-        actually committed.
+    def V(w, h, inner):
+        """bit (a + b*S) set when a w x h room at (a, b) of the plot is allowed (inner: strictly inside)"""
+        key = (w, h, inner)
+        if key not in Vcache:
+            m = 0
+            for b in range(H - h + 1):
+                for a in range(W - w + 1):
+                    if inner:
+                        if a < 1 or b < 1 or a + w + 1 > W or b + h + 1 > H:
+                            continue
+                        r = rmask(a - 1, b - 1, w + 2, h + 2)
+                    else:
+                        r = rmask(a, b, w, h)
+                    if inside & r == r:
+                        m |= 1 << (a + b * S)
+            Vcache[key] = m
+        return Vcache[key]
 
-        `require_single_hole` only requires the FINAL layout to have at
-        most one leftover region, not that every pocket that splits off
-        mid-search gets tiled -- so if this branch hasn't claimed its one
-        allowed hole yet (`hole_geom[0] is None`), one failing pocket is
-        still a live option. Only a second simultaneous failure is a sure
-        reject."""
-        if not require_single_hole:
-            return True
-        comps = _free_space_components(new_free)
-        if len(comps) <= 1:
-            return True
-        remaining = remaining_ids()
-        total_remaining_area = sum(sizes[i][0] * sizes[i][1] for i in remaining) if remaining else 0
-        min_side = min(min(sizes[i]) for i in remaining) if remaining else 0
-        freebies = 1 if hole_geom[0] is None else 0
-        for pocket in comps[1:]:
-            ok = bool(remaining) and pocket.area <= total_remaining_area + 1e-6
-            if ok:
-                minx, miny, maxx, maxy = pocket.bounds
-                if (maxx - minx) < min_side - 1e-6 or (maxy - miny) < min_side - 1e-6:
-                    ok = False
-            if not ok:
-                if freebies > 0:
-                    freebies -= 1
-                    continue
-                return False
-        return True
+    def Tof(T, r, i):
+        x, y, w, h = r
+        s = x + y * S
+        v = V(w, h, i in interior)
+        return T & ((v >> s) if s >= 0 else (v << -s))
 
-    def boundary_ok(rx, ry, w, h) -> bool:
-        return (not require_boundary_touch) or _shares_boundary_edge(rx, ry, w, h, boundary)
-
-    def placements_of(idx, point, free_shape, check_hole=True):
-        """All valid (rx, ry, w, h, new_free) placements of rect `idx`
-        anchored at `point`, both orientations, all 4 quadrant offsets.
-        `check_hole=False` skips single_hole_ok: `_tile_pocket` already
-        recurses into whatever sub-pieces a placement leaves, so that
-        filter would just redo the same search. Cheap plain-Python checks
-        (`boundary_ok`, `required_adjacency_ok`) run before the shapely
-        `.difference()` that only `single_hole_ok` needs."""
-        px, py = point
-        w0, h0 = sizes[idx]
-        out = []
-        for uw, uh in {(w0, h0), (h0, w0)}:
-            for ox, oy in _candidate_offsets(uw, uh):
-                rx, ry = px + ox, py + oy
-                candidate = box(rx, ry, rx + uw, ry + uh)
-                if not _rect_fits(free_shape, candidate):
-                    continue
-                if not boundary_ok(rx, ry, uw, uh):
-                    continue
-                if not required_adjacency_ok(idx, rx, ry, uw, uh):
-                    continue
-                new_free = free_shape.difference(candidate)
-                if check_hole and not single_hole_ok(new_free):
-                    continue
-                out.append((rx, ry, uw, uh, new_free))
-        return out
-
-    def _rect_still_placeable(q_idx, free_shape) -> bool:
-        """Whether the not-yet-placed `q_idx` could be placed anywhere in
-        the current free space, checked across every live vertex.
-        `required_adjacency_ok` checks exactly against every placed rect,
-        so this existence check is sound: free space only shrinks, so a
-        rect unplaceable now stays unplaceable later in this branch (a
-        boundary stretch can still split into a new vertex later, but
-        that's an accepted limitation of the anchor-at-a-vertex convention)."""
-        for v in _polygon_vertices(free_shape):
-            _check_time()
-            if placements_of(q_idx, v, free_shape):
-                return True
+    def touch(a, b):
+        ax, ay, aw, ah = a
+        bx, by, bw, bh = b
+        if ax + aw == bx or bx + bw == ax:
+            return min(ay + ah, by + bh) - max(ay, by) > 0
+        if ay + ah == by or by + bh == ay:
+            return min(ax + aw, bx + bw) - max(ax, bx) > 0
         return False
 
-    def _tile_pocket(pocket_shape, depth_limit=3):
-        """Try to exactly close `pocket_shape` using one or more remaining
-        rects: anchor a rect at a live vertex, and if it leaves a
-        sub-piece, recurse into that too, until the pocket is fully
-        covered or every option is exhausted. Returns the list of forced
-        ids on success (left applied to `placements`), or None on
-        failure with everything rolled back. `depth_limit` bounds
-        recursion depth (structural, not a work budget); wall-clock cost
-        is bounded by `_check_time`."""
-        if pocket_shape.is_empty or pocket_shape.area < 1e-9:
-            return []
-        if depth_limit <= 0:
-            return None
-        remaining = remaining_ids()
-        if not remaining:
-            return None
-        # cheap prunes before any shapely candidate generation
-        pminx, pminy, pmaxx, pmaxy = pocket_shape.bounds
-        pw, ph = pmaxx - pminx, pmaxy - pminy
-        if sum(sizes[i][0] * sizes[i][1] for i in remaining) < pocket_shape.area - 1e-6:
-            return None
-        fitting_ids = [
-            i for i in remaining
-            if (sizes[i][0] <= pw + 1e-6 and sizes[i][1] <= ph + 1e-6)
-            or (sizes[i][1] <= pw + 1e-6 and sizes[i][0] <= ph + 1e-6)
-        ]
-        if not fitting_ids:
-            return None
-        verts = _polygon_vertices(pocket_shape)
-        for point in verts:
-            for idx in fitting_ids:
-                for (rx, ry, uw, uh, new_pocket) in placements_of(idx, point, pocket_shape, check_hole=False):
-                    _check_time()
-                    placements[idx] = (rx, ry, uw, uh)
-                    forced_here = [idx]
-                    ok = True
-                    for comp in _free_space_components(new_pocket):
-                        sub_forced = _tile_pocket(comp, depth_limit - 1)
-                        if sub_forced is None:
-                            ok = False
-                            break
-                        forced_here.extend(sub_forced)
-                    if ok:
-                        return forced_here
-                    for f_idx in forced_here:
-                        if f_idx in placements:
-                            del placements[f_idx]
-        return None
+    def overlap(a, b):
+        return (min(a[0] + a[2], b[0] + b[2]) > max(a[0], b[0]) and
+                min(a[1] + a[3], b[1] + b[3]) > max(a[1], b[1]))
 
-    import os as _os_dbg
-    _TILE_DEBUG = bool(_os_dbg.environ.get("TILE_DEBUG"))
-    _fp_calls = [0]
+    placed: Dict[int, tuple] = {}
+    orient = {i: ([size[i]] if size[i][0] == size[i][1] else [size[i], (size[i][1], size[i][0])]) for i in ids}
 
-    def _tile_one_pocket_logged(pocket):
-        _fp_calls[0] += 1
-        t0 = time.perf_counter()
-        sub_forced = _tile_pocket(pocket)
-        if _TILE_DEBUG:
-            print(f"[fill_pockets] call#{_fp_calls[0]} pocket_area={pocket.area:.2f} "
-                  f"remaining={len(remaining_ids())} time_used={time.perf_counter() - t0:.3f}s "
-                  f"result={'FAIL' if sub_forced is None else sub_forced}",
-                  file=__import__('sys').stderr)
-        return sub_forced
+    def legal(i, r, T):
+        """new translation set if room i may go at r, else 0"""
+        if abs(r[0]) > W or abs(r[1]) > H:
+            return 0
+        pi = partners[i]
+        rx, ry, rw, rh = r
+        rx2 = rx + rw
+        ry2 = ry + rh
+        for j, (qx, qy, qw, qh) in placed.items():
+            qx2 = qx + qw
+            qy2 = qy + qh
+            ox = rx2 > qx and qx2 > rx          # positive overlap of the x ranges
+            oy = ry2 > qy and qy2 > ry
+            if ox and oy:
+                return 0                        # the rooms overlap
+            if ((oy and (rx2 == qx or qx2 == rx)) or (ox and (ry2 == qy or qy2 == ry))) != (j in pi):
+                return 0                        # touching (shared wall of positive length) must equal "required"
+        return Tof(T, r, i)
 
-    def _fill_pockets_shortcut(free_shape):
-        """A placement can split free space into a main piece plus small
-        pockets. Yields every viable way to resolve them, best first, as
-        (forced_ids, active_free_shape) pairs:
+    def candidates(i, aj):
+        out = set()
+        if aj is not None:
+            px, py, pw, ph = placed[aj]
+            for (w, h) in orient[i]:
+                for yy in range(py - h + 1, py + ph):
+                    out.add((px + pw, yy, w, h)); out.add((px - w, yy, w, h))
+                for xx in range(px - w + 1, px + pw):
+                    out.add((xx, py + ph, w, h)); out.add((xx, py - h, w, h))
+        else:
+            for (w, h) in orient[i]:
+                for xx in range(-W, W + 1):
+                    for yy in range(-H, H + 1):
+                        out.add((xx, yy, w, h))
+        return sorted(out)
 
-          1. Tile every pocket exactly via `_tile_pocket`.
-          2. If that fails and `hole_geom[0]` is still None, try freezing
-             each pocket in turn (leave it untouched forever, excluded
-             from the active free_shape) while tiling the rest -- this is
-             the one leftover region `require_single_hole` allows.
-
-        Mutates `placements`/`hole_geom[0]` to match whichever
-        alternative is currently yielded; a caller that keeps looping
-        past a failed alternative triggers this generator's own cleanup
-        (after the `yield`) before producing the next one."""
-        comps = _free_space_components(free_shape)
-        if len(comps) <= 1:
-            yield [], free_shape
-            return
-        main = comps[0]
-        pockets = comps[1:]
-
-        def tile_all(skip_index=None):
-            forced = []
-            for i, pocket in enumerate(pockets):
-                if i == skip_index:
-                    continue
-                sub_forced = _tile_one_pocket_logged(pocket)
-                if sub_forced is None:
-                    for f_idx in forced:
-                        del placements[f_idx]
-                    return None
-                forced.extend(sub_forced)
-            return forced, main
-
-        result = tile_all()
-        if result is not None:
-            forced, active = result
-            yield forced, active
-            for f_idx in forced:
-                del placements[f_idx]
-
-        if hole_geom[0] is None:
-            for i, pocket in enumerate(pockets):
-                result = tile_all(skip_index=i)
-                if result is None:
-                    continue
-                forced, active = result
-                hole_geom[0] = pocket
-                yield forced, active
-                hole_geom[0] = None
-                for f_idx in forced:
-                    del placements[f_idx]
-
-    def _slot_count(opts, point):
-        """MRV constrainedness: number of distinct quadrant slots among
-        `opts`. Fitting both orientations in the same quadrant doesn't
-        count as extra freedom, so this counts slots, not raw
-        orientation x quadrant combinations."""
-        px, py = point
-        slots = set()
-        for (rx, ry, w, h, _new_free) in opts:
-            qx = 0 if abs(rx - px) < 1e-9 else 1
-            qy = 0 if abs(ry - py) < 1e-9 else 1
-            slots.add((qx, qy))
-        return len(slots)
-
-    def local_score(idx, point, free_shape):
-        """`_slot_count` computed fresh; use only when `placements_of`'s
-        result isn't already in hand elsewhere."""
-        return _slot_count(placements_of(idx, point, free_shape), point)
-
-    def point_score(point, originator, free_shape):
-        """MRV score for a frontier point: score of its most constrained
-        PTPG-eligible candidate, +inf if none."""
-        candidates = [i for i in required_partners.get(originator, []) if i in remaining_ids()]
-        if not candidates:
-            return float("inf")
-        return min(local_score(i, point, free_shape) for i in candidates)
-
-    def order_points(points_with_originator, free_shape):
-        """Sort newly-exposed (point, originator) pairs by MRV."""
-        return sorted(points_with_originator, key=lambda po: point_score(po[0], po[1], free_shape))
-
-    def seed_step(free_shape):
-        """Point-first seed selection: fix one anchor point, rank every
-        remaining id placeable there, and exhaust every tied candidate at
-        that point before trying a different point.
-
-        `triangle_corner_ids` is the PRIMARY rank, above degree: a known
-        corner rect has nowhere else to go, so every point/candidate
-        combo involving one is tried, everywhere, before any combo
-        involving a non-corner rect. Degree in required_adjacency is the
-        next rank (corner rooms tend to be lowest-degree); geometric
-        local_score is the tie-break after that, then largest area
-        first. Among degree-1 candidates, a point that's also one of the
-        plot's own inner-L corners (`inner_l_points`) is preferred, since
-        a degree-1 room tends to sit in a plot's inward notch on real
-        floorplans."""
-        verts = _polygon_vertices(free_shape)
-        anchor_verts = [p for p in verts if boundary.distance(Point(p)) < 1e-9]
-        remaining = remaining_ids()
-        per_point = []
-        for p in anchor_verts:
-            _check_time()
-            scored = []
-            for idx in remaining:
-                opts = placements_of(idx, p, free_shape)
-                if not opts:
-                    continue
-                is_corner = 0 if idx in triangle_corner_ids else 1
-                deg = len(required_partners.get(idx, []))
-                w, h = sizes[idx]
-                scored.append((is_corner, deg, _slot_count(opts, p), -(w * h), idx, opts))
-            if not scored:
-                continue
-            scored.sort(key=lambda t: t[:5])
-            # one entry per (corner, degree) level, so a failed
-            # lowest-degree or non-corner seed falls back to the next
-            # level rather than giving up
-            for is_corner in sorted({c for c, _, _, _, _, _ in scored}):
-                at_corner = [row for row in scored if row[0] == is_corner]
-                for level in sorted({d for _, d, _, _, _, _ in at_corner}):
-                    level_score = min(s for _, d, s, _, _, _ in at_corner if d == level)
-                    tied = sorted(
-                        ((idx, opts) for _, d, s, _, idx, opts in at_corner if (d, s) == (level, level_score)),
-                        key=lambda t: -(sizes[t[0]][0] * sizes[t[0]][1]),
-                    )
-                    is_inner_l = 0 if (level == 1 and p in inner_l_points) else 1
-                    per_point.append((is_corner, level, is_inner_l, level_score, p, tied))
-        if not per_point:
-            return None
-        per_point.sort(key=lambda t: (t[0], t[1], t[2], t[3]))
-        return [(deg, score, p, tied) for (_ic, deg, _il, score, p, tied) in per_point]
-
-    def remaining_ids():
-        return [i for i in sizes if i not in placements]
-
-    def solve(free_shape, frontier):
+    def rec(T, prev=None, pr=None):
+        # prev: room -> (anchor, options) computed at the parent; pr = (room, position) just placed.
+        # An option list stays valid for the child after one more check against the new room and one AND with T.
         nodes[0] += 1
-        _check_time()
-        remaining = remaining_ids()
-        if not remaining:
-            if require_single_hole:
-                total_pieces = _num_components(free_shape) + (1 if hole_geom[0] is not None else 0)
-                if total_pieces > 1:
-                    return False
-            if collect_solutions is not None:
-                key = _layout_key(placements)
-                if key not in seen_layouts:
-                    seen_layouts.add(key)
-                    collect_solutions.append(dict(placements))
-                    if max_solutions is not None and len(collect_solutions) >= max_solutions:
-                        return True
-                # keep backtracking to find a genuinely different placement
-                return False
-            return True
-
-        if frontier:
-            # plain FIFO over the frontier
-            (point, originator), *rest = frontier
-            candidates = [i for i in required_partners.get(originator, []) if i in remaining]
-            if not candidates:
-                return solve(free_shape, rest)
-            cand_opts = {i: placements_of(i, point, free_shape) for i in candidates}
-            candidates.sort(key=lambda i: (_slot_count(cand_opts[i], point), -(sizes[i][0] * sizes[i][1])))
-
-            for cand in candidates:
-                for (rx, ry, w, h, new_free) in cand_opts[cand]:
-                    _check_time()
-                    placements[cand] = (rx, ry, w, h)
-                    new_points = order_points([(p, cand) for p in _new_frontier_points(rx, ry, w, h, point, new_free)], new_free)
-
-                    # forward-check: did this placement leave a required
-                    # partner of `cand` or `originator` unplaceable?
-                    dead = False
-                    for q in required_partners.get(cand, []):
-                        if q in remaining_ids() and not _rect_still_placeable(q, new_free):
-                            dead = True
-                            break
-                    if not dead:
-                        for q in required_partners.get(originator, []):
-                            if q != cand and q in remaining_ids() and not _rect_still_placeable(q, new_free):
-                                dead = True
-                                break
-                    if dead:
-                        del placements[cand]
+        if node_budget is not None and nodes[0] > node_budget:
+            raise _Budget
+        if t_end is not None and time.perf_counter() > t_end:
+            raise _Timeout
+        rest = [i for i in ids if i not in placed]
+        if not rest:
+            if on_solution is None:
+                return T
+            # collecting mode: report this arrangement at (up to per_arrangement of) its plot positions, keep searching
+            idxs = []
+            t = T
+            while t:
+                low = t & -t
+                idxs.append(low.bit_length() - 1)
+                t ^= low
+            if len(idxs) > per_arrangement:
+                step = (len(idxs) - 1) / max(per_arrangement - 1, 1)
+                idxs = [idxs[round(k * step)] for k in range(per_arrangement)] if per_arrangement > 1 else idxs[:1]
+            for idx in idxs:
+                ux, uy = idx % S, idx // S
+                lay = {i: (float((placed[i][0] + ux + x0) * g), float((placed[i][1] + uy + y0) * g),
+                           float(placed[i][2] * g), float(placed[i][3] * g)) for i in ids}
+                if on_solution(lay):
+                    raise _Budget
+            return 0
+        front = [i for i in rest if any(j in placed for j in partners[i])]
+        pool = front if front else [max(rest, key=lambda i: size[i][0] * size[i][1])]
+        # next room: every room touching the cluster is checked, and one with no legal position cuts the branch
+        cand_list = []
+        for i in pool:
+            aj = next((j for j in partners[i] if j in placed), None)
+            pc = prev.get(i) if prev else None
+            if pc is not None and aj is not None and pc[0] == aj:
+                p, (qx, qy, qw, qh) = pr
+                pin = p in partners[i]
+                qx2 = qx + qw
+                qy2 = qy + qh
+                opts = []
+                for r, T2 in pc[1]:
+                    rx, ry, rw, rh = r
+                    rx2 = rx + rw
+                    ry2 = ry + rh
+                    ox = rx2 > qx and qx2 > rx
+                    oy = ry2 > qy and qy2 > ry
+                    if ox and oy:
                         continue
+                    if ((oy and (rx2 == qx or qx2 == rx)) or (ox and (ry2 == qy or qy2 == ry))) != pin:
+                        continue
+                    T3 = T2 & T
+                    if T3:
+                        opts.append((r, T3))
+            else:
+                opts = []
+                for r in candidates(i, aj):
+                    T2 = legal(i, r, T)
+                    if T2:
+                        opts.append((r, T2))
+            if not opts:
+                return 0
+            cand_list.append((i, opts, aj))
+            if rule == "mrv" and len(opts) == 1:
+                break
+        if rule == "mrv":
+            i, opts, _a = min(cand_list, key=lambda t: len(t[1]))
+        else:
+            i, opts, _a = min(cand_list, key=lambda t: len(t[1]) / (size[t[0]][0] * size[t[0]][1]))
+        child_prev = {k: (a, o) for (k, o, a) in cand_list if k != i}
+        for r, T2 in opts:
+            placed[i] = r
+            res = rec(T2, child_prev, (i, r))
+            if res:
+                return res
+            del placed[i]
+        return 0
 
-                    # triangle shortcut: force in a required partner
-                    # shared by two already-placed rects, at their L-union
-                    # reflex corner or the shared perpendicular line
-                    def resolve_chain(pending_pairs, extra_points, cur_free):
-                        if not pending_pairs:
-                            for forced_ids, filled_free in _fill_pockets_shortcut(cur_free):
-                                result = solve(filled_free, extra_points + rest)
-                                if result is True or result is None:
-                                    return result
-                            return False
-
-                        (a, b), *rest_pairs = pending_pairs
-                        common = [
-                            t for t in required_partners.get(a, [])
-                            if t in required_partners.get(b, []) and t in remaining_ids()
-                        ]
-                        if not common:
-                            return resolve_chain(rest_pairs, extra_points, cur_free)
-
-                        points_to_try = []
-                        reflex = _reflex_corner(placements[a], placements[b])
-                        if reflex is not None:
-                            points_to_try.append(reflex)
-                        for shared in _shared_corners(placements[a], placements[b]):
-                            line = _perpendicular_search_line(placements[a], placements[b], shared)
-                            if line is not None:
-                                points_to_try.extend(_anchor_points_on_line(cur_free, *line))
-
-                        any_option = False
-                        for t_idx in common:
-                            for pt in points_to_try:
-                                for (tx, ty, tw, th, t_free) in placements_of(t_idx, pt, cur_free):
-                                    _check_time()
-                                    any_option = True
-                                    placements[t_idx] = (tx, ty, tw, th)
-                                    t_points = order_points([(p, t_idx) for p in _new_frontier_points(tx, ty, tw, th, pt, t_free)], t_free)
-                                    result = resolve_chain(rest_pairs, extra_points + t_points, t_free)
-                                    if result is True or result is None:
-                                        return result
-                                    del placements[t_idx]
-                        if not any_option:
-                            return False
-                        return False
-
-                    result = resolve_chain([(originator, cand)], new_points, new_free)
-                    if result is True or result is None:
-                        return result
-                    del placements[cand]
-
-            # every candidate failed here; if `originator` has no other
-            # pending point left, this is a verified dead end
-            still_pending_for_originator = any(o == originator for (_, o) in rest)
-            if not still_pending_for_originator:
-                return False
-            return solve(free_shape, rest)
-
-        # frontier empty: seed a fresh rectangle, point-first
-        per_point = seed_step(free_shape)
-        if not per_point:
-            return False
-        for _deg, _score, point, tied in per_point:
-            for seed, opts in tied:
-                if seed not in remaining_ids():
-                    continue
-                for (rx, ry, uw, uh, new_free) in opts:
-                    placements[seed] = (rx, ry, uw, uh)
-                    new_points = order_points([(p, seed) for p in _new_frontier_points(rx, ry, uw, uh, point, new_free)], new_free)
-                    for forced_ids, filled_free in _fill_pockets_shortcut(new_free):
-                        result = solve(filled_free, new_points)
-                        if result is True or result is None:
-                            return result
-                    del placements[seed]
-        return False
-
+    # seed: most required neighbours; ties go to the smallest area (any room works as the seed, this only affects speed)
+    first = max(ids, key=lambda i: (len(partners[i]), -size[i][0] * size[i][1]))
+    final = 0
     try:
-        result = solve(poly, [])
-    except _SearchTimeout:
-        result = None
-
-    if collect_solutions is not None:
-        return result, collect_solutions, nodes[0]
-    if result is True:
-        return True, dict(placements), nodes[0]
-    if result is False:
+        for (w, h) in orient[first]:
+            r = (0, 0, w, h)
+            T = Tof(full, r, first)
+            if not T:
+                continue
+            placed[first] = r
+            final = rec(T)
+            if final:
+                break
+            del placed[first]
+    except _Timeout:
+        return None, None, nodes[0]
+    except _Budget:
+        return "budget", None, nodes[0]
+    if not final:
         return False, None, nodes[0]
-    return None, None, nodes[0]
+    idx = (final & -final).bit_length() - 1
+    ux, uy = idx % S, idx // S
+    return True, {i: (float((placed[i][0] + ux + x0) * g), float((placed[i][1] + uy + y0) * g),
+                      float(placed[i][2] * g), float(placed[i][3] * g)) for i in ids}, nodes[0]
 
 
-# --------------------------------------------------------------------------
-# Verification
-# --------------------------------------------------------------------------
-
-def _layout_key(placements: Dict[int, Placement]) -> tuple:
-    """Canonical geometry-only key for deduplicating layouts."""
-    return tuple(sorted(
-        (round(x, 6), round(y, 6), round(w, 6), round(h, 6))
-        for x, y, w, h in placements.values()
-    ))
+def _worker(rule, polygon, rects, required_adjacency, interior_ids, remaining, q):
+    """child process: one full search with the given rule, result put on the queue"""
+    t_end = None if remaining is None else time.perf_counter() + remaining
+    found, sol, n = _cluster_search(polygon, rects, required_adjacency, interior_ids=interior_ids,
+                                    t_end=t_end, rule=rule)
+    q.put((rule, found, sol, n))
 
 
-def verify_placements(polygon, placements) -> Tuple[int, int, int]:
-    """Returns (overlap_count, outside_boundary_count, hole_count)."""
-    boxes = [box(x, y, x + w, y + h) for x, y, w, h in placements.values()]
-    overlaps = sum(
-        1 for a in range(len(boxes)) for b in range(a + 1, len(boxes))
-        if boxes[a].intersection(boxes[b]).area > 1e-9
-    )
-    poly_shape = Polygon(polygon)
-    outside = sum(
-        1 for (x, y, w, h) in placements.values()
-        if poly_shape.intersection(box(x, y, x + w, y + h)).area < w * h - 1e-6
-    )
-    occupied = box(0, 0, 0, 0)
-    for x, y, w, h in placements.values():
-        occupied = occupied.union(box(x, y, x + w, y + h))
-    leftover = poly_shape.difference(occupied)
-    holes = len(leftover.geoms) if leftover.geom_type == "MultiPolygon" else (1 if not leftover.is_empty else 0)
-    return overlaps, outside, holes
+def _pack_cluster_parallel(polygon, rects, required_adjacency, interior_ids, t_end):
+    """both rules at once in two processes; the first one to decide wins and the other is stopped"""
+    import multiprocessing as mp
+    import queue as _queue
+    ctx = mp.get_context()
+    q = ctx.Queue()
+    remaining = None if t_end is None else max(0.0, t_end - time.perf_counter())
+    procs = [ctx.Process(target=_worker, daemon=True,
+                         args=(rule, polygon, rects, required_adjacency, list(interior_ids), remaining, q))
+             for rule in ("mrv", "area")]
+    for p in procs:
+        p.start()
+    got = 0
+    nodes = 0
+    try:
+        while got < 2:
+            wait = None if t_end is None else max(0.05, t_end - time.perf_counter() + 3.0)
+            try:
+                rule, found, sol, n = q.get(timeout=wait)
+            except _queue.Empty:
+                return None, None, nodes
+            got += 1
+            nodes += n
+            if found is not None:
+                return found, sol, nodes
+        return None, None, nodes
+    finally:
+        for p in procs:
+            if p.is_alive():
+                p.terminate()
+        for p in procs:
+            p.join(timeout=2)
 
 
-# --------------------------------------------------------------------------
-# Rendering
-# --------------------------------------------------------------------------
+def _pack_cluster_sequential(polygon, rects, required_adjacency, interior_ids, t_end, first_budget):
+    """one core: both rules in turn with doubling node budgets (restarts); costs several times the better rule"""
+    total = 0
+    budget = first_budget
+    while True:
+        for rule in ("mrv", "area"):
+            found, sol, nodes = _cluster_search(polygon, rects, required_adjacency, interior_ids=interior_ids,
+                                                t_end=t_end, rule=rule, node_budget=budget)
+            total += nodes
+            if found != "budget":
+                return found, sol, total
+        budget *= 2
 
-def render_solution_grid(polygon, solutions, save_path, cols=5):
-    """Saves a grid with one panel per solution (a dict of placements)."""
-    import math
-    import matplotlib.pyplot as plt
-    import matplotlib.patches as patches
 
-    n = len(solutions)
-    if n == 0:
-        raise ValueError("no solutions to render")
-    cols = min(cols, n)
-    rows = math.ceil(n / cols)
-    xs_all = [p[0] for p in polygon]
-    ys_all = [p[1] for p in polygon]
-    xlim = (min(xs_all) - 1, max(xs_all) + 1)
-    ylim = (min(ys_all) - 1, max(ys_all) + 1)
+def find_layouts(polygon, rects: Dict[int, tuple], required_adjacency=None, *,
+                 interior_ids: Iterable[int] = (), max_layouts=100, time_limit=60.0, per_arrangement=4, rule="mrv"):
+    """Collect several valid layouts instead of one. Returns (layouts, complete, nodes).
+    Every distinct arrangement of the rooms (relative positions and orientations) is visited by the search; each
+    arrangement is reported at up to `per_arrangement` positions of the plot (spread evenly over all positions where
+    it fits; pass a huge number for all of them). complete is True when the search ran to the end (so no
+    arrangement is missing), False when it stopped at max_layouts or at the time limit."""
+    out = []
 
-    fig, axes = plt.subplots(rows, cols, figsize=(3.4 * cols, 3.4 * rows))
-    axes = [axes] if n == 1 else axes.flatten()
+    def cb(lay):
+        out.append(lay)
+        return len(out) >= max_layouts
 
-    bx = [p[0] for p in polygon] + [polygon[0][0]]
-    by = [p[1] for p in polygon] + [polygon[0][1]]
+    found, _, nodes = _cluster_search(polygon, rects, required_adjacency, interior_ids=interior_ids,
+                                      t_end=time.perf_counter() + time_limit, rule=rule,
+                                      on_solution=cb, per_arrangement=per_arrangement)
+    return out, found is False, nodes
 
-    for i, placements in enumerate(solutions):
-        ax = axes[i]
-        ax.plot(bx, by, "k-", linewidth=1.5)
-        for x, y, w, h in placements.values():
-            ax.add_patch(patches.Rectangle((x, y), w, h, linewidth=0.8, edgecolor="black",
-                                            facecolor="tab:blue", alpha=0.65))
-            ax.text(x + w / 2, y + h / 2, f"{w:g}x{h:g}", ha="center", va="center", fontsize=6)
-        ax.set_xlim(*xlim)
-        ax.set_ylim(*ylim)
-        ax.set_aspect("equal")
-        ax.set_xticks([])
-        ax.set_yticks([])
-        ax.set_title(f"solution {i + 1}", fontsize=9)
 
-    for j in range(n, len(axes)):
-        axes[j].axis("off")
+def diverse_layouts(polygon, rects, required_adjacency=None, *, interior_ids=(), k=10, pool=1500,
+                    time_limit=60.0, min_diff=3, rule="mrv"):
+    """Up to k layouts that differ from each other as much as possible. The search collects a pool of up to `pool`
+    layouts (one per arrangement; time_limit seconds at most), then picks greedily: first the first layout, then
+    each time the layout whose smallest difference to the ones already picked is largest. The difference of two
+    layouts is the number of rooms whose position relative to the room with id 0 is not the same (a shifted
+    copy of the same arrangement counts as the same layout). A layout is only picked while it differs from every
+    picked one in at least min_diff rooms, so fewer than k layouts can come back. Returns
+    (chosen, pool_size, complete, nodes); complete is True when the pool holds every arrangement."""
+    ids = sorted(rects)
+    pooled = []
 
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    return save_path
+    def cb(lay):
+        pooled.append(lay)
+        return len(pooled) >= pool
+
+    found, _, nodes = _cluster_search(polygon, rects, required_adjacency, interior_ids=interior_ids,
+                                      t_end=time.perf_counter() + time_limit, rule=rule,
+                                      on_solution=cb, per_arrangement=1)
+    rel = [{i: (lay[i][0] - lay[ids[0]][0], lay[i][1] - lay[ids[0]][1], lay[i][2], lay[i][3]) for i in ids}
+           for lay in pooled]
+
+    def diff(a, b):
+        return sum(1 for i in ids if a[i] != b[i])
+
+    chosen = []
+    if pooled:
+        chosen = [0]
+        best = [diff(rel[0], r) for r in rel]            # distance of each layout to the picked set
+        while len(chosen) < k:
+            j = max(range(len(rel)), key=lambda q: best[q])
+            if best[j] < min_diff:
+                break
+            chosen.append(j)
+            best = [min(best[q], diff(rel[j], rel[q])) for q in range(len(rel))]
+    return [pooled[j] for j in chosen], len(pooled), found is False, nodes
+
+
+def unused_regions(polygon, placements):
+    """(number of separate unused pieces, number of those closed in by rooms, i.e. not touching the plot boundary)"""
+    from shapely.geometry import Polygon, box
+    from shapely.ops import unary_union
+    plot = Polygon(polygon)
+    left = plot.difference(unary_union([box(x, y, x + w, y + h) for x, y, w, h in placements.values()]))
+    parts = [gm for gm in (left.geoms if hasattr(left, "geoms") else [left])
+             if gm.geom_type == "Polygon" and gm.area > 1e-9]
+    return len(parts), sum(1 for gm in parts if not gm.intersects(plot.exterior))
+
+
+def pack_cluster(polygon, rects: Dict[int, tuple], required_adjacency=None, *,
+                 interior_ids: Iterable[int] = (), time_limit: Optional[float] = 60.0, first_budget: int = 3000):
+    """Cluster-first solver. Step 1: the "fewest legal positions" rule alone for first_budget nodes, which
+    settles most instances at once. Step 2 (hard instances): the same rule and an "fewest positions per unit
+    of area" rule run at the same time in two processes, and the first search to finish decides the answer
+    (a finished search is exhaustive, so "no solution" is a proper answer). On a one-core machine step 2
+    falls back to running the two rules in turn. Returns (found, placements, nodes) with found True / False /
+    None (time limit); nodes counts step 1 plus the winning search."""
+    import os
+    t_end = None if time_limit is None else time.perf_counter() + time_limit
+    found, sol, n0 = _cluster_search(polygon, rects, required_adjacency, interior_ids=interior_ids,
+                                     t_end=t_end, rule="mrv", node_budget=first_budget)
+    if found != "budget":
+        return found, sol, n0
+    if (os.cpu_count() or 1) >= 2:
+        found, sol, n1 = _pack_cluster_parallel(polygon, rects, required_adjacency, interior_ids, t_end)
+    else:
+        found, sol, n1 = _pack_cluster_sequential(polygon, rects, required_adjacency, interior_ids, t_end,
+                                                  first_budget * 2)
+    return found, sol, n0 + n1
 
 
 # --------------------------------------------------------------------------
 # Example plots
 # --------------------------------------------------------------------------
 
+# Each example may also carry an optional  labels={0: "Living", 1: "Kitchen", ...}
+# (room id -> name). Labelled rooms are drawn with that name; others with their number.
 EXAMPLES = {
     1: dict(
-        polygon=[(0, 0), (25, 0), (25, 15), (15, 15), (15, 30), (0, 30)],
-        rects=dict(enumerate([(15, 6), (10, 6), (15, 4), (15, 4), (8, 7), (7, 7), (5, 9), (16, 9), (4, 9)])),
-        required_adjacency=[(0, 2), (0, 4), (0, 5), (1, 2), (1, 3), (1, 7), (2, 3),
-                             (3, 6), (3, 7), (3, 8), (4, 5), (6, 7), (6, 8)],
+        polygon=[(0, 0), (24, 0), (24, 16), (16, 16), (16, 24), (0, 24)],
+        rects=dict(enumerate([(24, 4), (8, 7), (8, 7), (13, 4), (7, 4), (4, 4), (16, 4), (16, 5), (7, 4), (8, 4), (1, 4)])),
+        required_adjacency=[(0, 6), (0, 7), (1, 4), (1, 7), (2, 3), (2, 4), (3, 5), (3, 6), (5, 6),
+                             (8, 3), (8, 6), (8, 7), (8, 0), (8, 9), (9, 3), (9, 2), (9, 4), (9, 7), (9, 10), (10, 4), (10, 1), (10, 7)],
+        interior=[8, 9, 10],
     ),
     2: dict(
-        polygon=[(0, 0), (24, 0), (24, 16), (16, 16), (16, 24), (0, 24)],
-        rects=dict(enumerate([(24, 4), (8, 7), (8, 7), (13, 4), (7, 4), (4, 4), (16, 4), (16, 5)])),
-        required_adjacency=[(0, 6), (0, 7), (1, 4), (1, 7), (2, 3), (2, 4), (3, 5), (3, 6), (5, 6)],
-    ),
-    3: dict(
         polygon=[(0, 0), (35, 0), (35, 20), (22, 20), (22, 40), (0, 40)],
         rects=dict(enumerate([(8, 8), (13, 10), (14, 8), (17, 12), (12, 10), (5, 5), (5, 5),
-                               (12, 10), (6, 5), (6, 5), (10, 10), (5, 7), (5, 5)])),
+                               (12, 10), (6, 5), (6, 5), (10, 10), (5, 7), (5, 5), (12, 10)])),
         required_adjacency=[(0, 2), (0, 12), (0, 3), (2, 3), (3, 12), (3, 11),
                             (12, 11), (3, 10), (11, 10), (10, 5), (10, 4), (5, 4), (5, 6), (6, 4), (4, 7), (7, 8),
-                            (7, 9), (7, 1), (8, 9), (9, 1)],
+                            (7, 9), (7, 1), (8, 9), (9, 1),
+                            (13, 4), (13, 7), (13, 3), (13, 10), (13, 1)],
+        interior=[],
+    ),
+    3: dict(
+        polygon=[(0, 0), (24, 0), (24, 8), (12, 8), (12, 20), (0, 20)],
+        rects=dict(enumerate([(6, 8), (6, 6), (3, 7), (6, 4), (6, 2), (4, 6), (11, 4), (9, 2), (3, 8), (3, 3), (6, 4), (5, 5), (3, 9)])),
+        required_adjacency=[(0, 3), (0, 5), (1, 2), (1, 4), (2, 6), (3, 4), (3, 5), (6, 8), (7, 8),
+                             (9, 2), (9, 6), (9, 8), (9, 7), (9, 11), (10, 5), (10, 3), (10, 4), (10, 1), (10, 2), (10, 11), (11, 5), (11, 2), (11, 7), (11, 12), (12, 7)],
+        interior=[9, 10],
     ),
     4: dict(
-        polygon=[(0, 0), (24, 0), (24, 8), (12, 8), (12, 20), (0, 20)],
-        rects=dict(enumerate([(6, 8), (6, 6), (3, 7), (6, 4), (6, 2), (4, 6), (11, 4), (9, 2), (3, 8)])),
-        required_adjacency=[(0, 3), (0, 5), (1, 2), (1, 4), (2, 6), (3, 4), (3, 5), (6, 8), (7, 8)],
+        polygon=[(0, 0), (20, 0), (20, 15), (10, 15), (10, 30), (0, 30)],
+        rects=dict(enumerate([(6, 6), (11, 4), (1, 5), (2, 4), (9, 6), (6, 10), (5, 10), (9, 5), (10, 2), (4, 10), (5, 9), (3, 5), (4, 7)])),
+        required_adjacency=[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7), (7, 8), (8, 0),
+                             (9, 0), (9, 1), (9, 7), (9, 8), (9, 10), (9, 11), (10, 2), (10, 3), (10, 5), (10, 6), (10, 7), (10, 11), (10, 12), (11, 1), (11, 2), (12, 3), (12, 4), (12, 5)],
+        interior=[9, 10, 11, 12],
     ),
     5: dict(
-        polygon=[(0, 0), (20, 0), (20, 15), (10, 15), (10, 30), (0, 30)],
-        rects=dict(enumerate([(6, 6), (11, 4), (1, 5), (2, 4), (9, 6), (6, 10), (5, 10), (9, 5), (10, 2)])),
-        required_adjacency=[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7), (7, 8), (8, 0)],
+        polygon=[(0, 0), (16, 0), (16, 6), (9, 6), (9, 14), (0, 14)],
+        rects=dict(enumerate([(6, 4), (3, 3), (3, 4), (5, 3), (3, 8), (3, 6), (5, 2), (3, 4), (2, 3), (6, 2), (4, 5), (3, 1), (1, 3)])),
+        required_adjacency=[(0, 1), (0, 2), (1, 2), (2, 3), (1, 3), (2, 4), (3, 4), (3, 5), (3, 9), (4, 5), (5, 6), (6, 7), (7, 8), (8, 9),
+                             (10, 3), (10, 5), (10, 6), (10, 7), (10, 11), (10, 12), (11, 7), (11, 8), (11, 9), (11, 12), (12, 3), (12, 9)],
+        interior=[10, 11, 12],
     ),
     6: dict(
-        polygon=[(0, 0), (16, 0), (16, 6), (9, 6), (9, 14), (0, 14)],
-        rects=dict(enumerate([(6, 4), (3, 3), (3, 4), (5, 3), (3, 8), (3, 6), (5, 2), (3, 4), (2, 3), (6, 2)])),
-        required_adjacency=[(0, 1), (0, 2), (1, 2), (2, 3), (1, 3), (2, 4), (3, 4), (3, 5), (3, 9), (4, 5), (5, 6), (6, 7), (7, 8), (8, 9)],
+        polygon=[(0, 7), (0, 13), (20, 13), (20, 0), (13, 0), (13, 7)],
+        rects=dict(enumerate([(7, 4), (7, 3), (2, 3), (4, 4), (2, 3), (2, 2), (2, 5), (2, 2), (2, 4), (4, 5), (3, 4), (3, 4), (11, 1), (3, 3), (1, 2)])),
+        required_adjacency=[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7), (7, 8), (8, 9), (7, 9), (9, 10), (10, 11),
+                             (12, 7), (12, 9), (12, 6), (12, 5), (12, 4), (12, 3), (12, 10), (12, 11), (12, 13), (13, 3), (13, 0), (13, 11), (13, 14), (14, 3), (14, 2), (14, 0)],
+        interior=[12],
     ),
     7: dict(
-        polygon=[(0, 0), (16, 0), (16, 8), (6, 8), (6, 23), (0, 23)],
-        rects=dict(enumerate([(3, 2), (3, 2), (6, 2), (3, 2), (3, 2), (4, 6),
-                               (5, 6), (8, 5), (8, 3), (3, 2), (3, 2), (3, 4), (5, 4), (3, 4)])),
-        required_adjacency=[
-            (0, 1), (0, 2), (1, 2), (2, 3), (2, 4), (3, 4),
-            (1, 5), (2, 5), (4, 5), (5, 6), (6, 7), (6, 8),
-            (7, 8), (8, 9), (9, 10), (10, 11), (11, 12), (12, 13), (13, 8),
-        ],
+        polygon=[(0, 0), (18, 0), (18, 13), (10, 13), (10, 24), (0, 24)],
+        rects=dict(enumerate([(9, 6),(4, 4),(4, 4),(6, 4),(4, 4),(5, 6),(3, 4),(2, 4),(4, 4),(3, 4),(5, 5),(7, 7),(5, 3), (2, 7), (7, 2), (1, 3), (5, 2), (2, 5)])),
+        required_adjacency=[(0, 1), (0, 2), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (5, 7), (6, 7), (7, 8), (8, 9), (9, 10), (10, 11), (11, 12),
+                             (13, 3), (13, 4), (13, 5), (13, 8), (13, 9), (13, 10), (13, 15), (14, 0), (14, 2), (14, 3), (14, 10), (14, 11), (14, 15), (14, 16), (15, 3), (15, 10), (16, 0), (16, 11), (16, 12), (16, 17), (17, 0), (17, 12)],
+        interior=[14, 15, 16],
     ),
     8: dict(
-        polygon=[(0, 7), (0, 13), (20, 13), (20, 0), (13, 0), (13, 7)],
-        rects=dict(enumerate([(7, 4), (7, 3), (2, 3), (4, 4), (2, 3), (2, 2), (2, 5), (2, 2), (2, 4), (4, 5), (3, 4), (3, 4)])),
-        required_adjacency=[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7), (7, 8), (8, 9), (7, 9), (9, 10), (10, 11)],
+        # the 18-room plan with an 8x8 atrium hole; interior rooms 8, 14, 15, 17
+        polygon=[(0, 0), (40, 0), (40, 20), (20, 20), (20, 40), (0, 40)],
+        rects=dict(enumerate([(10, 10), (10, 10), (10, 5), (10, 5), (10, 5), (10, 5), (10, 10), (10, 10), (10, 5), (10, 5), (10, 5), (10, 5), (20, 6), (6, 14), (4, 6), (4, 6), (6, 6), (6, 8)])),
+        required_adjacency=[(0, 1), (0, 2), (1, 3), (2, 3), (2, 4), (3, 5), (4, 5), (4, 13), (4, 14), (5, 15), (5, 16), (6, 7), (6, 8), (6, 16), (6, 17), (7, 9), (8, 9), (8, 10), (8, 12), (8, 17), (9, 11), (10, 11), (10, 12), (12, 13), (12, 17), (13, 14), (14, 15), (15, 16), (16, 17)],
+        interior=[],
     ),
-    9: dict(
-        polygon=[(0, 0),(21,0),(21,6),(9,6),(9,18),(0,18)],
-        rects=dict(enumerate([(6,8),(6,4),(2,2),(3,2),(4,5),(2,5),(3,5),(2,5),(3,3),(4,9)])),
-        required_adjacency=[(0,1),(1,2),(2,3),(3,4),(4,5),(5,6),(6,7),(7,8),(8,9)],
+    9: dict(   # 11 rooms, wall only 57% covered, 2 hole(s)
+        polygon=[(0, 0), (12, 0), (12, 5), (6, 5), (6, 11), (0, 11)],
+        rects={0: (3, 3), 1: (3, 4), 2: (2, 2), 3: (2, 3), 4: (4, 2), 5: (4, 3), 6: (2, 2), 7: (2, 3), 8: (2, 2), 9: (2, 3), 10: (3, 2)},
+        required_adjacency=[(0, 3), (0, 6), (0, 9), (0, 10), (1, 7), (1, 8), (2, 5), (2, 6), (2, 7), (2, 8), (3, 5), (3, 10), (4, 9), (4, 10), (5, 6), (6, 7), (7, 8)],
+        interior=[],
     ),
-    10: dict(
-        polygon=[(0, 0), (18, 0), (18, 13), (10, 13), (10, 24), (0, 24)],
-        rects=dict(enumerate([(9, 6),(4, 4),(4, 4),(6, 4),(4, 4),(5, 6),(3, 4),(2, 4),(4, 4),(3, 4),(5, 5),(7, 7),(5, 3)])),
-        required_adjacency=[(0, 1), (0, 2), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (5, 7), (6, 7), (7, 8), (8, 9), (9, 10), (10, 11), (11, 12)],
+    10: dict(   # two-connected, sparse, 15 rooms
+        polygon=[(0, 0), (17, 0), (17, 13), (3, 13), (3, 16), (0, 16)],
+        rects={0: (5, 2), 1: (3, 6), 2: (3, 6), 3: (3, 2), 4: (2, 2), 5: (5, 2), 6: (6, 4), 7: (5, 3), 8: (3, 2), 9: (2, 2), 10: (2, 5), 11: (4, 2), 12: (3, 5), 13: (2, 3), 14: (2, 4)},
+        required_adjacency=[(0, 2), (0, 6), (0, 9), (1, 3), (1, 7), (1, 8), (1, 13), (1, 14), (2, 10), (3, 10), (3, 13), (4, 6), (4, 9), (4, 11), (5, 6), (5, 12), (5, 14), (6, 8), (6, 14), (7, 12), (8, 14), (9, 11), (12, 14)],
+        interior=[],
+    ),
+    11: dict(   # two-connected, sparse, 12 rooms
+        polygon=[(0, 0), (14, 0), (14, 7), (7, 7), (7, 15), (0, 15)],
+        rects={0: (5, 5), 1: (6, 3), 2: (2, 2), 3: (4, 4), 4: (4, 4), 5: (2, 5), 6: (6, 2), 7: (2, 2), 8: (4, 2), 9: (2, 2), 10: (2, 2), 11: (2, 2)},
+        required_adjacency=[(0, 3), (0, 5), (1, 4), (1, 6), (1, 7), (1, 8), (2, 9), (2, 11), (3, 5), (3, 10), (3, 11), (4, 7), (4, 8), (4, 9), (4, 10), (5, 11), (6, 7), (7, 10), (10, 11)],
+        interior=[],
+    ),
+    12: dict(   # two-connected, dense, 12 rooms
+        polygon=[(0, 0), (13, 0), (13, 4), (7, 4), (7, 13), (0, 13)],
+        rects={0: (4, 3), 1: (2, 3), 2: (4, 2), 3: (3, 3), 4: (4, 2), 5: (2, 3), 6: (5, 2), 7: (2, 3), 8: (4, 5), 9: (4, 2), 10: (3, 2), 11: (2, 2)},
+        required_adjacency=[(0, 1), (0, 5), (1, 2), (1, 4), (2, 3), (2, 4), (3, 4), (4, 6), (5, 6), (5, 7), (6, 8), (7, 8), (7, 11), (8, 9), (8, 10), (8, 11), (9, 10), (9, 11)],
+        interior=[],
+    ),
+    13: dict(   # two-connected, dense, 12 rooms
+        polygon=[(0, 0), (11, 0), (11, 6), (7, 6), (7, 11), (0, 11)],
+        rects={0: (5, 2), 1: (4, 2), 2: (2, 4), 3: (4, 3), 4: (3, 2), 5: (5, 2), 6: (4, 3), 7: (2, 4), 8: (2, 3), 9: (2, 2), 10: (2, 3), 11: (2, 2)},
+        required_adjacency=[(0, 1), (0, 3), (0, 4), (1, 2), (1, 4), (1, 9), (2, 9), (2, 11), (3, 4), (3, 5), (3, 6), (4, 5), (4, 9), (5, 6), (5, 7), (5, 9), (5, 11), (6, 7), (6, 8), (6, 10), (7, 10), (8, 10)],
+        interior=[4],
+    ),
+    14: dict(   # two-connected, dense, 14 rooms
+        polygon=[(0, 0), (13, 0), (13, 8), (7, 8), (7, 11), (0, 11)],
+        rects={0: (2, 5), 1: (2, 4), 2: (2, 2), 3: (3, 5), 4: (4, 3), 5: (3, 2), 6: (3, 5), 7: (2, 3), 8: (3, 2), 9: (5, 2), 10: (2, 2), 11: (3, 2), 12: (3, 2), 13: (2, 2)},
+        required_adjacency=[(0, 1), (0, 6), (0, 7), (1, 2), (1, 6), (1, 10), (2, 3), (2, 10), (3, 4), (3, 5), (3, 8), (3, 9), (3, 10), (4, 5), (5, 9), (6, 7), (6, 8), (6, 10), (6, 11), (6, 12), (6, 13), (8, 9), (8, 13), (11, 12), (12, 13)],
+        interior=[],
+    ),
+    15: dict(   # two-connected, sparse, 13 rooms
+        polygon=[(0, 0), (18, 0), (18, 8), (7, 8), (7, 16), (0, 16)],
+        rects={0: (3, 5), 1: (5, 4), 2: (6, 6), 3: (3, 2), 4: (3, 6), 5: (3, 5), 6: (2, 3), 7: (3, 5), 8: (6, 2), 9: (3, 2), 10: (2, 3), 11: (2, 2), 12: (2, 2)},
+        required_adjacency=[(0, 1), (0, 4), (0, 10), (0, 11), (0, 12), (1, 7), (1, 8), (1, 10), (1, 11), (2, 3), (2, 6), (3, 5), (4, 6), (4, 9), (4, 12), (5, 9), (6, 12), (7, 8), (8, 10), (11, 12)],
+        interior=[],
+    ),
+    16: dict(   # two-connected, dense, 13 rooms
+        polygon=[(0, 0), (11, 0), (11, 10), (5, 10), (5, 13), (0, 13)],
+        rects={0: (5, 2), 1: (2, 3), 2: (2, 4), 3: (3, 5), 4: (3, 3), 5: (5, 2), 6: (2, 4), 7: (3, 5), 8: (2, 5), 9: (3, 2), 10: (3, 4), 11: (2, 2), 12: (2, 2)},
+        required_adjacency=[(0, 1), (0, 3), (1, 2), (1, 4), (2, 5), (2, 6), (3, 4), (3, 7), (3, 8), (4, 5), (4, 8), (4, 9), (5, 6), (5, 9), (5, 10), (7, 8), (7, 12), (8, 9), (8, 11), (8, 12), (9, 10), (9, 11)],
+        interior=[],
+    ),
+    17: dict(   # two-connected, sparse, 13 rooms
+        polygon=[(0, 0), (14, 0), (14, 4), (8, 4), (8, 15), (0, 15)],
+        rects={0: (4, 6), 1: (6, 2), 2: (2, 4), 3: (6, 4), 4: (6, 2), 5: (4, 2), 6: (2, 4), 7: (2, 2), 8: (2, 2), 9: (2, 2), 10: (2, 3), 11: (3, 2), 12: (2, 3)},
+        required_adjacency=[(0, 2), (0, 6), (0, 7), (0, 10), (0, 11), (0, 12), (1, 3), (1, 4), (2, 4), (2, 12), (3, 8), (4, 11), (5, 9), (5, 10), (6, 9), (6, 12), (7, 8), (8, 11)],
+        interior=[],
+    ),
+    18: dict(   # two-connected, sparse, 12 rooms
+        polygon=[(0, 0), (17, 0), (17, 9), (7, 9), (7, 14), (0, 14)],
+        rects={0: (5, 5), 1: (3, 6), 2: (6, 3), 3: (5, 2), 4: (5, 5), 5: (5, 2), 6: (5, 4), 7: (2, 2), 8: (2, 2), 9: (2, 4), 10: (4, 2), 11: (3, 2)},
+        required_adjacency=[(0, 1), (0, 4), (0, 7), (0, 9), (1, 3), (1, 5), (1, 9), (1, 11), (2, 4), (2, 6), (2, 8), (3, 11), (4, 6), (4, 7), (4, 10), (5, 7), (5, 8), (5, 11), (6, 10)],
+        interior=[],
+    ),
+    19: dict(   # two-connected, dense, 12 rooms
+        polygon=[(0, 0), (13, 0), (13, 7), (7, 7), (7, 11), (0, 11)],
+        rects={0: (2, 4), 1: (5, 2), 2: (4, 2), 3: (4, 3), 4: (2, 3), 5: (3, 5), 6: (5, 4), 7: (4, 2), 8: (5, 2), 9: (2, 3), 10: (2, 2), 11: (2, 2)},
+        required_adjacency=[(0, 1), (0, 3), (1, 2), (1, 3), (1, 5), (2, 4), (2, 5), (3, 5), (3, 6), (4, 7), (5, 7), (5, 9), (5, 10), (6, 8), (6, 9), (7, 10), (7, 11), (8, 9), (10, 11)],
+        interior=[],
+    ),
+    20: dict(   # two-connected, sparse, 13 rooms
+        polygon=[(0, 0), (14, 0), (14, 4), (11, 4), (11, 14), (0, 14)],
+        rects={0: (3, 5), 1: (6, 6), 2: (2, 3), 3: (2, 6), 4: (6, 3), 5: (2, 2), 6: (2, 5), 7: (2, 2), 8: (2, 3), 9: (3, 2), 10: (4, 2), 11: (4, 2), 12: (2, 2)},
+        required_adjacency=[(0, 1), (0, 4), (0, 9), (1, 2), (1, 6), (1, 7), (1, 8), (1, 11), (1, 12), (2, 8), (3, 6), (3, 9), (4, 12), (5, 7), (5, 10), (6, 11), (7, 10), (7, 11), (8, 10)],
+        interior=[],
+    ),
+    21: dict(   # two-connected, dense, 12 rooms
+        polygon=[(0, 0), (11, 0), (11, 7), (8, 7), (8, 11), (0, 11)],
+        rects={0: (2, 2), 1: (2, 5), 2: (2, 4), 3: (3, 2), 4: (5, 3), 5: (5, 2), 6: (3, 3), 7: (4, 3), 8: (4, 3), 9: (2, 3), 10: (2, 2), 11: (3, 2)},
+        required_adjacency=[(0, 1), (0, 9), (1, 2), (1, 5), (1, 9), (2, 3), (2, 4), (3, 4), (3, 10), (4, 6), (4, 10), (4, 11), (5, 6), (5, 7), (5, 9), (6, 8), (6, 11), (7, 8)],
+        interior=[],
+    ),
+    22: dict(   # two-connected, sparse, 14 rooms
+        polygon=[(0, 0), (16, 0), (16, 10), (6, 10), (6, 14), (0, 14)],
+        rects={0: (5, 2), 1: (5, 4), 2: (6, 3), 3: (2, 4), 4: (4, 4), 5: (2, 4), 6: (2, 2), 7: (4, 3), 8: (5, 2), 9: (2, 4), 10: (3, 2), 11: (2, 5), 12: (2, 2), 13: (2, 3)},
+        required_adjacency=[(0, 8), (0, 10), (1, 8), (1, 10), (1, 11), (2, 3), (2, 6), (2, 10), (2, 12), (3, 9), (3, 12), (4, 5), (4, 7), (4, 9), (4, 13), (5, 13), (6, 7), (6, 9), (7, 9), (7, 11), (8, 10), (9, 13), (10, 11)],
+        interior=[],
+    ),
+    23: dict(   # two-connected, dense, 13 rooms
+        polygon=[(0, 0), (13, 0), (13, 8), (7, 8), (7, 13), (0, 13)],
+        rects={0: (4, 2), 1: (2, 2), 2: (4, 4), 3: (5, 2), 4: (3, 4), 5: (3, 5), 6: (2, 4), 7: (3, 3), 8: (2, 3), 9: (2, 3), 10: (5, 3), 11: (2, 4), 12: (2, 2)},
+        required_adjacency=[(0, 1), (0, 3), (1, 2), (1, 3), (2, 4), (2, 7), (2, 8), (3, 5), (3, 6), (4, 9), (5, 6), (5, 10), (6, 7), (6, 11), (7, 8), (7, 11), (8, 9), (10, 11), (10, 12), (11, 12)],
+        interior=[],
+    ),
+    24: dict(   # two-connected, dense, 13 rooms
+        polygon=[(0, 0), (13, 0), (13, 7), (9, 7), (9, 13), (0, 13)],
+        rects={0: (5, 2), 1: (4, 2), 2: (4, 3), 3: (2, 4), 4: (4, 3), 5: (5, 4), 6: (5, 2), 7: (4, 3), 8: (4, 2), 9: (4, 3), 10: (5, 2), 11: (2, 2), 12: (2, 2)},
+        required_adjacency=[(0, 1), (0, 3), (0, 4), (1, 2), (1, 4), (2, 5), (2, 11), (3, 4), (3, 6), (4, 5), (5, 7), (5, 11), (5, 12), (6, 7), (6, 8), (7, 10), (8, 9), (9, 10), (11, 12)],
+        interior=[],
+    ),
+    25: dict(   # two-connected, dense, 14 rooms
+        polygon=[(0, 0), (13, 0), (13, 9), (10, 9), (10, 13), (0, 13)],
+        rects={0: (4, 4), 1: (5, 4), 2: (4, 2), 3: (5, 2), 4: (4, 2), 5: (4, 5), 6: (3, 2), 7: (4, 5), 8: (2, 3), 9: (4, 2), 10: (2, 4), 11: (4, 2), 12: (3, 2), 13: (2, 3)},
+        required_adjacency=[(0, 1), (0, 3), (1, 2), (1, 3), (1, 4), (1, 5), (2, 4), (3, 5), (3, 7), (4, 6), (5, 6), (5, 8), (5, 9), (5, 10), (6, 8), (6, 13), (7, 9), (7, 11), (8, 10), (8, 13), (9, 10), (9, 12), (11, 12)],
+        interior=[],
+    ),
+    26: dict(   # two-connected, sparse, 13 rooms
+        polygon=[(0, 0), (14, 0), (14, 11), (6, 11), (6, 16), (0, 16)],
+        rects={0: (3, 2), 1: (6, 6), 2: (2, 2), 3: (3, 2), 4: (2, 4), 5: (4, 5), 6: (2, 4), 7: (5, 3), 8: (5, 4), 9: (2, 5), 10: (3, 2), 11: (2, 2), 12: (2, 2)},
+        required_adjacency=[(0, 4), (0, 12), (1, 2), (1, 3), (1, 4), (1, 11), (1, 12), (2, 8), (2, 10), (3, 6), (3, 11), (4, 7), (5, 9), (5, 10), (5, 12), (6, 7), (8, 10), (9, 12)],
+        interior=[],
+    ),
+    27: dict(   # two-connected, sparse, 15 rooms
+        polygon=[(0, 0), (16, 0), (16, 11), (13, 11), (13, 14), (0, 14)],
+        rects={0: (6, 3), 1: (5, 2), 2: (2, 4), 3: (4, 4), 4: (3, 3), 5: (5, 4), 6: (3, 4), 7: (5, 2), 8: (2, 2), 9: (3, 4), 10: (3, 5), 11: (2, 2), 12: (5, 2), 13: (2, 2), 14: (2, 3)},
+        required_adjacency=[(0, 6), (0, 7), (0, 13), (0, 14), (1, 4), (1, 9), (1, 11), (2, 3), (2, 14), (3, 8), (3, 10), (3, 14), (4, 9), (4, 13), (5, 7), (5, 13), (6, 10), (8, 12), (11, 12)],
+        interior=[],
+    ),
+    28: dict(   # two-connected, sparse, 15 rooms
+        polygon=[(0, 0), (15, 0), (15, 8), (8, 8), (8, 14), (0, 14)],
+        rects={0: (3, 4), 1: (3, 6), 2: (6, 5), 3: (3, 2), 4: (2, 5), 5: (6, 2), 6: (2, 3), 7: (2, 4), 8: (2, 3), 9: (2, 2), 10: (2, 2), 11: (3, 3), 12: (2, 2), 13: (2, 2), 14: (2, 2)},
+        required_adjacency=[(0, 1), (0, 5), (0, 11), (1, 7), (1, 9), (1, 11), (2, 3), (2, 5), (2, 6), (2, 10), (2, 12), (3, 8), (3, 12), (3, 14), (4, 6), (4, 7), (4, 10), (4, 13), (5, 8), (6, 13), (7, 9), (8, 12), (8, 14)],
+        interior=[],
+    ),
+    29: dict(   # two-connected, sparse, 14 rooms
+        polygon=[(0, 0), (16, 0), (16, 11), (9, 11), (9, 15), (0, 15)],
+        rects={0: (4, 3), 1: (5, 2), 2: (2, 2), 3: (6, 5), 4: (5, 5), 5: (4, 4), 6: (2, 5), 7: (5, 2), 8: (5, 2), 9: (5, 2), 10: (3, 3), 11: (2, 2), 12: (3, 2), 13: (2, 4)},
+        required_adjacency=[(0, 3), (0, 10), (1, 7), (1, 8), (1, 10), (2, 4), (2, 7), (3, 9), (3, 10), (3, 12), (3, 13), (4, 7), (4, 9), (5, 6), (5, 9), (6, 11), (6, 12), (8, 10), (11, 12), (12, 13)],
+        interior=[],
+    ),
+    30: dict(   # two-connected, sparse, 15 rooms
+        polygon=[(0, 0), (14, 0), (14, 9), (11, 9), (11, 17), (0, 17)],
+        rects={0: (6, 4), 1: (6, 6), 2: (5, 3), 3: (6, 4), 4: (2, 3), 5: (2, 6), 6: (2, 2), 7: (3, 2), 8: (2, 5), 9: (2, 2), 10: (2, 3), 11: (2, 4), 12: (2, 3), 13: (3, 2), 14: (2, 2)},
+        required_adjacency=[(0, 2), (0, 6), (0, 13), (1, 3), (1, 8), (1, 11), (1, 13), (2, 6), (2, 9), (2, 12), (3, 7), (3, 8), (3, 11), (4, 8), (4, 9), (5, 9), (5, 12), (7, 10), (8, 10), (8, 14), (10, 14)],
+        interior=[],
+    ),
+    31: dict(   # two-connected, sparse, 15 rooms
+        polygon=[(0, 0), (14, 0), (14, 11), (8, 11), (8, 14), (0, 14)],
+        rects={0: (4, 6), 1: (5, 3), 2: (2, 2), 3: (6, 2), 4: (2, 3), 5: (3, 4), 6: (3, 3), 7: (3, 2), 8: (3, 3), 9: (2, 3), 10: (2, 3), 11: (2, 2), 12: (4, 2), 13: (2, 2), 14: (3, 2)},
+        required_adjacency=[(0, 6), (0, 8), (0, 11), (0, 14), (1, 3), (1, 9), (1, 12), (2, 11), (2, 14), (3, 5), (3, 9), (4, 12), (4, 13), (5, 8), (6, 12), (6, 13), (7, 9), (7, 10), (7, 12), (8, 14), (9, 10)],
+        interior=[],
+    ),
+    32: dict(   # two-connected, sparse, 14 rooms
+        polygon=[(0, 0), (16, 0), (16, 10), (12, 10), (12, 15), (0, 15)],
+        rects={0: (5, 5), 1: (3, 4), 2: (2, 6), 3: (4, 6), 4: (6, 3), 5: (4, 3), 6: (4, 6), 7: (2, 6), 8: (3, 2), 9: (3, 2), 10: (3, 2), 11: (2, 2), 12: (2, 2), 13: (3, 2)},
+        required_adjacency=[(0, 8), (0, 10), (0, 12), (1, 3), (1, 8), (1, 10), (2, 4), (2, 5), (2, 6), (2, 13), (3, 9), (3, 11), (4, 5), (4, 6), (4, 7), (5, 7), (6, 13), (7, 12), (9, 11), (11, 13)],
+        interior=[],
+    ),
+    33: dict(   # two-connected, sparse, 14 rooms
+        polygon=[(0, 0), (16, 0), (16, 10), (12, 10), (12, 14), (0, 14)],
+        rects={0: (2, 6), 1: (2, 5), 2: (4, 4), 3: (4, 6), 4: (6, 4), 5: (2, 2), 6: (5, 2), 7: (5, 4), 8: (4, 3), 9: (3, 2), 10: (3, 2), 11: (3, 2), 12: (2, 3), 13: (2, 2)},
+        required_adjacency=[(0, 1), (0, 8), (0, 12), (0, 13), (1, 10), (1, 13), (2, 4), (2, 5), (2, 6), (2, 12), (3, 5), (3, 7), (3, 8), (3, 9), (4, 6), (4, 11), (5, 12), (6, 10), (7, 11), (8, 9)],
+        interior=[],
+    ),
+    34: dict(   # house plan 1: 20 rooms, plot 60 x 66 with a 24 x 26 corner removed, two-connected
+        polygon=[(24, 0), (60, 0), (60, 66), (0, 66), (0, 26), (24, 26)],
+        rects={0: (12, 10), 1: (10, 5), 2: (10, 5), 3: (20, 10), 4: (12, 10), 5: (12, 10), 6: (30, 20), 7: (18, 10), 8: (18, 10), 9: (12, 10), 10: (12, 10), 11: (10, 10), 12: (18, 10), 13: (10, 5), 14: (10, 5), 15: (18, 10), 16: (18, 10), 17: (18, 6), 18: (18, 8), 19: (18, 14)},
+        required_adjacency=[(0, 1), (0, 2), (0, 5), (0, 6), (1, 2), (1, 3), (2, 3), (2, 6), (3, 4), (3, 6), (3, 7), (4, 7), (5, 6), (5, 9), (6, 7), (6, 8), (6, 9), (6, 10), (6, 11), (6, 12), (7, 8), (8, 12), (8, 13), (9, 10), (10, 11), (11, 12), (11, 15), (12, 13), (12, 14), (12, 15), (12, 18), (13, 14), (14, 18), (15, 16), (15, 18), (15, 19), (16, 17), (16, 19), (17, 19), (18, 19)],
+        interior=[2, 6, 12],
+        labels={0: 'Jill', 1: 'WC', 2: 'Bath', 3: 'Terrace', 4: 'Chef', 5: 'Jack', 6: 'Great room', 7: 'Internet / study', 8: 'Games', 9: 'Hall', 10: 'Utility', 11: 'Laundry', 12: 'Vestibule', 13: 'Powder', 14: 'Linen', 15: 'Loggia', 16: 'Courtyard', 17: 'Planter box', 18: 'Ensuite', 19: 'Boudoir'},
+    ),
+    35: dict(   # house plan 2: 22 rooms, 100 x 68 L plot (68 x 14 corner removed), two-connected
+        polygon=[(0, 14), (68, 14), (68, 0), (100, 0), (100, 68), (0, 68)],
+        rects={0: (17, 17), 1: (9, 11), 2: (15, 17), 3: (8, 17), 4: (10, 17), 5: (9, 11), 6: (7, 17), 7: (13, 17), 8: (8, 11), 9: (80, 6), 10: (8, 6), 11: (17, 17), 12: (6, 11), 13: (36, 26), 14: (9, 15), 15: (7, 5), 16: (13, 5), 17: (20, 12), 18: (9, 6), 19: (20, 9), 20: (20, 15), 21: (8, 33)},
+        required_adjacency=[(0, 1), (0, 9), (1, 2), (1, 9), (2, 3), (2, 9), (3, 4), (3, 9), (4, 5), (4, 9), (5, 6), (5, 9), (6, 7), (6, 9), (7, 8), (7, 9), (7, 10), (8, 10), (9, 10), (9, 11), (9, 12), (9, 13), (9, 14), (9, 15), (9, 16), (10, 16), (10, 21), (11, 12), (12, 13), (13, 14), (13, 18), (14, 15), (14, 17), (14, 18), (15, 16), (15, 17), (16, 17), (16, 21), (17, 18), (17, 19), (17, 21), (18, 19), (19, 20), (19, 21), (20, 21)],
+        interior=[14, 15, 16, 17],
+        labels={0: 'Bedroom 3', 1: 'Porch 1', 2: 'Master bed', 3: 'Closet', 4: 'M. bath', 5: 'Porch 2', 6: 'Office', 7: 'Bedroom 1', 8: 'Porch 3', 9: 'Hall', 10: 'Foyer', 11: 'Bedroom 2', 12: 'Mech.', 13: 'Garage', 14: 'Mudroom', 15: 'Linen', 16: 'Pantry', 17: 'Kitchen', 18: 'Bath 4', 19: 'Dining', 20: 'Living', 21: 'Porch (east)'},
+    ),
+    36: dict(   # floor plan 1 (exact dimensions): 11 rooms, 72 x 64 L plot
+        polygon=[(0, 64), (72, 64), (72, 0), (28, 0), (28, 19), (0, 19)],
+        rects={0: (21, 14), 1: (21, 21), 2: (20, 14), 3: (15, 10), 4: (21, 6), 5: (14, 20), 6: (21, 15), 7: (10, 12), 8: (11, 12), 9: (14, 19), 10: (24, 24)},
+        required_adjacency=[(0, 1), (0, 3), (1, 2), (1, 3), (1, 4), (1, 5), (2, 5), (3, 4), (3, 6), (4, 5), (4, 6), (4, 7), (4, 8), (5, 8), (5, 10), (6, 7), (7, 8), (7, 9), (8, 9), (8, 10), (9, 10)],
+        interior=[4, 8],
+        labels={0: 'Bed 1', 1: 'Living', 2: 'Dining', 3: 'Bath 1', 4: 'Hallway', 5: 'Kitchen', 6: 'Bed 2', 7: 'Bath 2', 8: 'Utility', 9: 'Courtyard', 10: 'Garage'},
+    ),
+    37: dict(   # floor plan 2 (exact dimensions): 22 rooms, 67 x 62 L plot
+        polygon=[(0, 62), (67, 62), (67, 14), (48, 14), (48, 0), (0, 0)],
+        rects={0: (7, 16), 1: (14, 16), 2: (15, 16), 3: (7, 10), 4: (7, 8), 5: (11, 14), 6: (7, 8), 7: (7, 6), 8: (11, 4), 9: (7, 4), 10: (18, 7), 11: (12, 7), 12: (14, 16), 13: (17, 16), 14: (18, 15), 15: (12, 9), 16: (7, 8), 17: (9, 8), 18: (15, 8), 19: (16, 14), 20: (15, 10), 21: (11, 15)},
+        required_adjacency=[(0, 1), (0, 12), (1, 2), (1, 12), (1, 13), (2, 3), (2, 4), (2, 11), (2, 13), (3, 4), (3, 5), (4, 5), (4, 8), (4, 11), (5, 6), (5, 7), (5, 8), (6, 7), (7, 9), (8, 9), (8, 10), (9, 10), (10, 11), (10, 14), (10, 15), (11, 13), (11, 14), (12, 13), (12, 16), (12, 17), (13, 14), (13, 17), (13, 18), (14, 15), (14, 18), (14, 21), (16, 17), (16, 19), (17, 18), (17, 19), (18, 20), (18, 21), (19, 20), (20, 21)],
+        interior=[4, 8, 11, 13, 17, 18],
+        labels={0: 'Outdoor Kitchen', 1: 'Covered Lanai', 2: 'Family Rm', 3: 'Bath 2', 4: 'W.I.C. (north)', 5: 'Bedroom 2', 6: 'Office', 7: 'P.R.', 8: 'Pantry', 9: 'Linen', 10: 'Wetbar', 11: 'Dinette', 12: 'Master', 13: 'Living Rm', 14: 'Kitchen', 15: 'Stairs', 16: 'Util.', 17: 'W.I.C. (south)', 18: 'Foyer', 19: 'Master Bath', 20: 'Entry', 21: 'Dining Rm'},
+    ),
+    38: dict(   # floor plan 3 (exact dimensions): 12 rooms, 74 x 75 L plot
+        polygon=[(0, 75), (74, 75), (74, 10), (25, 10), (25, 0), (0, 0)],
+        rects={0: (19, 17), 1: (12, 12), 2: (7, 12), 3: (19, 20), 4: (14, 10), 5: (19, 10), 6: (26, 11), 7: (12, 11), 8: (26, 30), 9: (19, 18), 10: (26, 11), 11: (23, 30)},
+        required_adjacency=[(0, 1), (0, 2), (0, 6), (0, 8), (1, 2), (1, 3), (2, 3), (2, 8), (3, 4), (3, 8), (3, 10), (4, 5), (4, 10), (6, 7), (6, 8), (7, 9), (8, 9), (8, 10), (8, 11), (9, 11), (10, 11)],
+        interior=[2, 8],
+        labels={0: 'Bedroom 1', 1: 'Bath', 2: 'Hallway', 3: 'Bedroom 2', 4: 'Utility', 5: 'Courtyard', 6: 'Study', 7: 'Store', 8: 'Liv-Din', 9: 'Kitchen', 10: 'Foyer', 11: 'Garage'},
+    ),
+    39: dict(   # floor plan 4 (exact dimensions): 16 rooms, 51 x 61 L plot
+        polygon=[(0, 61), (51, 61), (51, 0), (18, 0), (18, 8), (0, 8)],
+        rects={0: (7, 6), 1: (7, 6), 2: (11, 12), 3: (10, 7), 4: (4, 7), 5: (4, 27), 6: (14, 10), 7: (14, 10), 8: (18, 8), 9: (19, 14), 10: (19, 13), 11: (5, 8), 12: (7, 8), 13: (7, 17), 14: (7, 7), 15: (20, 20)},
+        required_adjacency=[(0, 1), (0, 2), (1, 2), (1, 3), (2, 3), (2, 4), (2, 5), (2, 9), (3, 4), (3, 6), (4, 5), (4, 6), (5, 6), (5, 7), (5, 8), (5, 9), (5, 10), (5, 13), (6, 7), (7, 8), (8, 13), (8, 14), (9, 10), (10, 11), (10, 12), (10, 13), (11, 12), (11, 13), (11, 15), (12, 15), (13, 14), (13, 15), (14, 15)],
+        interior=[4, 5, 11, 13],
+        labels={0: 'WC 1', 1: 'Store', 2: 'Bedroom 1', 3: 'Bathroom', 4: 'WC 2', 5: 'Hall 1', 6: 'Bedroom 2', 7: 'Bedroom 3', 8: 'Bedroom 4', 9: 'Living Room', 10: 'Kitchen - Dining', 11: 'Boiler', 12: 'Pantry', 13: 'Hall 2', 14: 'Entry', 15: 'Garage'},
+    ),
+    40: dict(   # graph 1 (16.json): 7 rooms, 12 pairs, 30 x 40 plot; solvable
+        polygon=[(0, 0), (30, 0), (30, 40), (0, 40)],
+        rects={1: (16, 13), 2: (6, 11), 3: (11, 11), 4: (15, 15), 5: (13, 13), 6: (12, 9), 7: (13, 13)},
+        required_adjacency=[(1, 2), (1, 3), (1, 7), (2, 3), (2, 4), (3, 4), (3, 5), (3, 6), (3, 7), (4, 5), (5, 6), (6, 7)],
+        interior=[3],
+    ),
+    41: dict(   # graph 2 (17.json): 8 rooms, 13 pairs, 25 x 30 plot; solvable
+        polygon=[(0, 0), (25, 0), (25, 30), (0, 30)],
+        rects={1: (5, 5), 2: (10, 10), 3: (6, 6), 4: (5, 10), 5: (8, 10), 6: (10, 10), 7: (10, 10), 8: (7, 7)},
+        required_adjacency=[(1, 2), (1, 4), (2, 3), (2, 5), (2, 6), (3, 6), (4, 5), (4, 7), (5, 6), (5, 7), (5, 8), (6, 8), (7, 8)],
+        interior=[5],
+    ),
+    42: dict(   # graph 3 (18.json): 15 rooms, 28 pairs, 70 x 65 plot; solvable
+        polygon=[(0, 0), (70, 0), (70, 65), (0, 65)],
+        rects={1: (11, 12), 2: (7, 6), 3: (11, 12), 4: (11, 5), 5: (21, 34), 6: (11, 13), 7: (9, 13), 8: (20, 13), 9: (15, 26), 10: (17, 11), 11: (14, 26), 12: (14, 16), 13: (12, 14), 14: (9, 14), 15: (21, 16)},
+        required_adjacency=[(1, 2), (1, 6), (1, 7), (2, 3), (2, 9), (3, 4), (3, 9), (3, 11), (4, 5), (4, 11), (5, 11), (5, 13), (5, 14), (6, 7), (6, 8), (7, 8), (7, 9), (8, 9), (8, 10), (9, 10), (9, 11), (10, 12), (11, 12), (11, 13), (12, 15), (13, 14), (13, 15), (14, 15)],
+        interior=[7, 9, 11, 13],
+    ),
+    43: dict(   # graph 4 (19.json): 8 rooms, 12 pairs, 40 x 35 plot; solvable
+        polygon=[(0, 0), (40, 0), (40, 35), (0, 35)],
+        rects={1: (15, 5), 2: (11, 13), 3: (6, 8), 4: (11, 14), 5: (24, 11), 6: (4, 11), 7: (6, 5), 8: (6, 5)},
+        required_adjacency=[(1, 2), (1, 3), (1, 4), (2, 3), (2, 8), (3, 4), (3, 7), (4, 5), (5, 6), (5, 7), (6, 8), (7, 8)],
+        interior=[3, 7],
+    ),
+    44: dict(   # graph 5 (20.json): 8 rooms, 13 pairs, 20 x 35 plot; NO SOLUTION (search finished)
+        polygon=[(0, 0), (20, 0), (20, 35), (0, 35)],
+        rects={1: (5, 5), 2: (10, 10), 3: (6, 6), 4: (5, 10), 5: (5, 10), 6: (10, 10), 7: (10, 10), 8: (7, 7)},
+        required_adjacency=[(1, 2), (1, 4), (2, 3), (2, 5), (2, 6), (3, 6), (4, 5), (4, 7), (5, 6), (5, 7), (5, 8), (6, 8), (7, 8)],
+        interior=[5],
+    ),
+    45: dict(   # graph 6 (eg1_1.json): 8 rooms, 14 pairs, 30 x 40 plot; solvable
+        polygon=[(0, 0), (30, 0), (30, 40), (0, 40)],
+        rects={1: (14, 13), 2: (12, 11), 3: (9, 10), 4: (5, 7), 5: (4, 6), 6: (11, 12), 7: (5, 8), 8: (13, 12)},
+        required_adjacency=[(1, 3), (1, 4), (1, 6), (1, 7), (1, 8), (2, 3), (2, 5), (3, 4), (3, 5), (4, 5), (4, 6), (5, 6), (6, 8), (7, 8)],
+        interior=[4],
+    ),
+    46: dict(   # graph 7 (eg_1_2.json): 8 rooms, 14 pairs, 30 x 40 plot; solvable
+        polygon=[(0, 0), (30, 0), (30, 40), (0, 40)],
+        rects={1: (14, 13), 2: (12, 11), 3: (9, 10), 4: (5, 7), 5: (4, 6), 6: (11, 12), 7: (5, 8), 8: (13, 12)},
+        required_adjacency=[(1, 2), (1, 3), (1, 4), (1, 6), (1, 7), (1, 8), (2, 3), (3, 4), (3, 5), (4, 5), (4, 6), (5, 6), (6, 8), (7, 8)],
+        interior=[4],
+    ),
+    47: dict(   # graph 8 (eg1_3.json): 8 rooms, 14 pairs, 35 x 35 plot; NO SOLUTION (search finished)
+        polygon=[(0, 0), (35, 0), (35, 35), (0, 35)],
+        rects={1: (14, 13), 2: (12, 11), 3: (9, 10), 4: (5, 7), 5: (4, 6), 6: (11, 12), 7: (5, 8), 8: (13, 12)},
+        required_adjacency=[(1, 2), (1, 3), (1, 4), (1, 6), (1, 7), (1, 8), (2, 3), (2, 5), (3, 4), (3, 5), (4, 5), (4, 6), (6, 8), (7, 8)],
+        interior=[3],
+    ),
+    48: dict(   # graph 9 (eg1_4.json): 8 rooms, 15 pairs, 40 x 35 plot; NO SOLUTION (search finished)
+        polygon=[(0, 0), (40, 0), (40, 35), (0, 35)],
+        rects={1: (14, 13), 2: (12, 11), 3: (9, 10), 4: (5, 7), 5: (4, 6), 6: (11, 12), 7: (5, 8), 8: (13, 12)},
+        required_adjacency=[(1, 2), (1, 3), (1, 4), (1, 7), (1, 8), (2, 3), (2, 5), (3, 4), (3, 5), (4, 5), (4, 6), (4, 8), (5, 6), (6, 8), (7, 8)],
+        interior=[3, 4],
     ),
 }
 
@@ -926,138 +748,307 @@ EXAMPLES = {
 # --------------------------------------------------------------------------
 # Interactive runner
 # --------------------------------------------------------------------------
+# In these examples `interior` lists the rooms that may NOT touch any wall. Every other room may or may
+# not touch a wall, and the leftover space may have any shape (any number of holes).
 
-def run_example(
-    choice: int,
-    max_solutions: int = 5,
-    time_limit: Optional[float] = 60.0,
-    required_adjacency: Optional[Iterable[Tuple[int, int]]] = None,
-):
-    """
-    `required_adjacency=None` uses the example's own PTPG. Pass an
-    explicit iterable (including `[]`, no two rects may touch) to
-    override it, or `False` to turn the adjacency constraint off entirely.
-    """
-    example = EXAMPLES[choice]
-    polygon, rects = example["polygon"], example["rects"]
-    if required_adjacency is False:
-        required_adjacency = None
-    elif required_adjacency is None:
-        required_adjacency = example.get("required_adjacency")
-
-    _solve_and_report(str(choice), polygon, rects, required_adjacency, max_solutions, time_limit)
-
-
-def run_custom_example(max_solutions: int = 5, time_limit: Optional[float] = 60.0):
-    """Prompt the user for their own polygon / rects / required_adjacency
-    and run the same solve-and-report flow as `run_example`. Each value is
-    typed as a plain Python literal and parsed with `ast.literal_eval`."""
-    print("\nEnter your own floorplan. Each value is a Python literal, e.g.:")
-    print("  polygon: [(0,0), (10,0), (10,10), (0,10)]")
-    print("  rects:   {0: (4,4), 1: (6,4), 2: (10,6)}")
-    print("  required_adjacency: [(0,1), (1,2)]   (or [] for none)")
-
+def _verify(polygon, placements, rects, adjacency, interior):
+    """Independent check with shapely (returns None if shapely is missing)."""
     try:
-        polygon = ast.literal_eval(input("\npolygon: ").strip())
-        rects_raw = ast.literal_eval(input("rects: ").strip())
-        rects = {int(k): tuple(v) for k, v in rects_raw.items()}
-        adj_raw = input("required_adjacency (blank for none): ").strip()
-        required_adjacency = ast.literal_eval(adj_raw) if adj_raw else []
-    except (ValueError, SyntaxError) as exc:
-        print(f"Could not parse that: {exc}")
-        return
+        from shapely.geometry import Polygon, box
+    except ImportError:
+        return None
+    P = Polygon(polygon)
+    bd = P.boundary
+    bs = {i: box(x, y, x + w, y + h) for i, (x, y, w, h) in placements.items()}
+    adj = {tuple(sorted(a)) for a in (adjacency or [])}
+    outside = sum(1 for b in bs.values() if not P.buffer(1e-9).contains(b))
+    ids = sorted(bs)
+    overlaps = wrong_adj = 0
+    for a in range(len(ids)):
+        for b in range(a + 1, len(ids)):
+            i, j = ids[a], ids[b]
+            if bs[i].intersection(bs[j]).area > 1e-9:
+                overlaps += 1
+            if (bs[i].boundary.intersection(bs[j].boundary).length > 1e-9) != ((i, j) in adj):
+                wrong_adj += 1
+    bad_int = sum(1 for i in (interior or ()) if bs[i].intersects(bd))
+    return overlaps, outside, wrong_adj, bad_int
 
-    _solve_and_report("custom", polygon, rects, required_adjacency, max_solutions, time_limit)
+
+def _draw_shapes(ax, polygon, placements, interior):
+    from matplotlib.patches import Polygon as MPoly, Rectangle
+    ax.add_patch(MPoly(polygon, closed=True, fill=False, ec="black", lw=2))
+    for i, (x, y, w, h) in placements.items():
+        ax.add_patch(Rectangle((x, y), w, h, fc="#f6c28b" if i in set(interior) else "#9ec5ee", ec="black"))
+    xs = [p[0] for p in polygon]; ys = [p[1] for p in polygon]
+    ax.set_xlim(min(xs) - 1, max(xs) + 1); ax.set_ylim(min(ys) - 1, max(ys) + 1)
+    ax.set_aspect("equal"); ax.axis("off")
 
 
-def _solve_and_report(label, polygon, rects, required_adjacency, max_solutions, time_limit):
-    n_adj = len(required_adjacency or [])
-    print(f"\nRunning example {label}: {len(rects)} rects, {n_adj} adjacencies")
+def _draw_labels(fig, ax, placements, labels, max_font=9.0):
+    """Room name + width x height, shrunk and wrapped to fit inside each room (call after fig.canvas.draw())."""
+    import textwrap
+    renderer = fig.canvas.get_renderer()
+    for i, (x, y, w, h) in placements.items():
+        label = str(labels.get(i, i))
+        dims = f"{w:g}\u00d7{h:g}"                  # width x height as placed
+        (px0, py0), (px1, py1) = ax.transData.transform((x, y)), ax.transData.transform((x + w, y + h))
+        bw, bh = abs(px1 - px0) * 0.9, abs(py1 - py0) * 0.85          # usable pixel box inside the room
+        best = None
+        for n in sorted({len(label)} | set(range(1, len(label) + 1))):
+            text = "\n".join(textwrap.wrap(label, n, break_long_words=False) or [label]) + "\n" + dims
+            if best is not None and text == best[1]:
+                continue
+            t = ax.text(x + w / 2, y + h / 2, text, ha="center", va="center", fontsize=10)
+            ext = t.get_window_extent(renderer)
+            t.remove()
+            f = min(max_font, 10.0 * min(bw / max(ext.width, 1e-6), bh / max(ext.height, 1e-6)))
+            if best is None or f > best[0]:
+                best = (f, text)
+        ax.text(x + w / 2, y + h / 2, best[1], ha="center", va="center", fontsize=max(best[0], 2.0), linespacing=1.0)
+
+
+def render(polygon, placements, save_path, interior=(), labels=None):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    side = 6 if len(placements) <= 12 else 9
+    fig, ax = plt.subplots(figsize=(side, side))
+    _draw_shapes(ax, polygon, placements, interior)
+    fig.canvas.draw()                              # fixes the data -> pixel scale so the names can be fitted
+    _draw_labels(fig, ax, placements, labels or {})
+    fig.savefig(save_path, dpi=120, bbox_inches="tight"); plt.close(fig)
+
+
+def render_many(polygon, layouts, save_path, interior=(), labels=None, titles=None):
+    """All the given layouts in one picture (a grid, at most 3 per row)."""
+    import math
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    n = len(layouts)
+    cols = min(3, n); rows = math.ceil(n / cols)
+    side = 7 if len(layouts[0]) <= 12 else 9
+    pw = max(p[0] for p in polygon) - min(p[0] for p in polygon) + 2
+    ph = max(p[1] for p in polygon) - min(p[1] for p in polygon) + 2
+    fig, axes = plt.subplots(rows, cols, figsize=(side * cols, side * rows * min(1.0, ph / pw + 0.12)), squeeze=False)
+    for ax in axes.flat:
+        ax.axis("off")
+    for k, lay in enumerate(layouts):
+        _draw_shapes(axes.flat[k], polygon, lay, interior)
+        if titles:
+            axes.flat[k].set_title(titles[k], fontsize=14)
+    fig.canvas.draw()
+    for k, lay in enumerate(layouts):
+        _draw_labels(fig, axes.flat[k], lay, labels or {}, max_font=11.0)
+    fig.savefig(save_path, dpi=100, bbox_inches="tight"); plt.close(fig)
+
+
+def layout_distance(a, b):
+    """How different two layouts are: the number of rooms whose position differs, measured relative to the
+    best-matching reference room (so sliding a whole layout sideways does not count as a difference)."""
+    ids = list(a)
+    best = len(ids)
+    for r in ids:
+        ax_, ay_ = a[r][0], a[r][1]; bx_, by_ = b[r][0], b[r][1]
+        d = sum(1 for i in ids if (a[i][0] - ax_, a[i][1] - ay_, a[i][2], a[i][3]) !=
+                (b[i][0] - bx_, b[i][1] - by_, b[i][2], b[i][3]))
+        if d < best:
+            best = d
+    return best
+
+
+def pick_diverse(layouts, k=10, min_distance=None):
+    """Up to k layouts that are far apart from each other (farthest-first). Stops early when every remaining
+    layout is closer than min_distance (rooms in a different place; default a quarter of the rooms, at least 4) to one already chosen, so it may return fewer."""
+    if not layouts:
+        return []
+    if min_distance is None:                 # a quarter of the rooms (at least 4) must be somewhere else
+        min_distance = max(4, -(-len(layouts[0]) // 4))
+    chosen = [0]
+    dist = [layout_distance(layouts[0], l) for l in layouts]
+    while len(chosen) < k:
+        j = max(range(len(layouts)), key=lambda t: dist[t])
+        if dist[j] < min_distance:
+            break
+        chosen.append(j)
+        for t, l in enumerate(layouts):
+            d = layout_distance(layouts[j], l)
+            if d < dist[t]:
+                dist[t] = d
+    return [layouts[j] for j in chosen]
+
+
+def render_text(polygon, placements, interior=()):
+    """Plain-text picture (no matplotlib needed): one character per unit cell, top row first.
+    Rooms are drawn with their id (0-9, then a-z, A-Z), '.' is empty space inside the plot."""
+    if any(abs(v - round(v)) > 1e-9 for p in polygon for v in p) or \
+       any(abs(v - round(v)) > 1e-9 for r in placements.values() for v in r):
+        return "(text picture needs whole-unit coordinates)"
+    glyph = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    W = int(round(max(p[0] for p in polygon))); H = int(round(max(p[1] for p in polygon)))
+    n = len(polygon)
+
+    def inside(cx, cy):
+        c = False
+        for k in range(n):
+            (ax, ay), (bx, by) = polygon[k], polygon[(k + 1) % n]
+            if ax == bx and min(ay, by) < cy < max(ay, by) and ax > cx:
+                c = not c
+        return c
+    rows = []
+    for j in range(H - 1, -1, -1):
+        line = ""
+        for i in range(W):
+            ch = " "
+            if inside(i + 0.5, j + 0.5):
+                ch = "."
+                for r, (x, y, w, h) in placements.items():
+                    if x <= i < x + w and y <= j < y + h:
+                        ch = glyph[r % len(glyph)]
+            line += ch
+        rows.append(line)
+    return "\n".join(rows)
+
+
+def _solve_and_report(label, polygon, rects, required_adjacency, time_limit, interior_ids=(), labels=None):
+    print(f"\nRunning example {label}: {len(rects)} rects, {len(required_adjacency or [])} adjacencies")
     print(f"  polygon: {polygon}")
     print(f"  rects:   {rects}")
     if required_adjacency:
         print(f"  required_adjacency (PTPG): {sorted(required_adjacency)}")
-
+    if interior_ids:
+        print(f"  interior rects (touch no wall): {sorted(interior_ids)}")
     t0 = time.perf_counter()
-    found0, placements0 = None, None
-    try:
-        found0, placements0, nodes0 = pack_rectangles_frontier(
-            polygon, rects,
-            required_adjacency,
-            require_single_hole=True,
-            require_boundary_touch=True,
-            time_limit=time_limit,
-        )
-        t1 = time.perf_counter()
-        status = "FEASIBLE" if found0 else "INFEASIBLE" if found0 is False else "INCONCLUSIVE"
-        print(f"\n  initial solve: {status}   nodes explored: {nodes0}   time: {t1 - t0:.3f}s")
-        if found0 and placements0:
-            overlaps0, outside0, holes0 = verify_placements(polygon, placements0)
-            poly_area0 = Polygon(polygon).area
-            coverage0 = sum(w * h for _, _, w, h in placements0.values()) / poly_area0 * 100
-            print(f"    coverage={coverage0:.1f}%  overlaps={overlaps0}  outside={outside0}  holes={holes0}")
-    except KeyboardInterrupt:
-        print("\n  interrupted -- moving on to the multi-solution search")
-
-    print(f"\n  searching for up to {max_solutions} distinct solutions... (Ctrl+C to stop early and keep what's found)")
-    solutions: list = [placements0] if (found0 is True and placements0) else []
-    interrupted = False
-    try:
-        found, solutions, nodes = pack_rectangles_frontier(
-            polygon, rects,
-            required_adjacency,
-            require_single_hole=True,
-            require_boundary_touch=True,
-            time_limit=time_limit,
-            collect_solutions=solutions,
-            max_solutions=max_solutions,
-        )
-    except KeyboardInterrupt:
-        interrupted = True
-        found = None
-        nodes = "?"
-
-    if not solutions:
-        if interrupted:
-            print(f"  interrupted before finding any solution (nodes explored: {nodes})")
-        elif found is False:
-            print(f"  proven infeasible: no solution exists under these constraints (nodes explored: {nodes})")
-        else:
-            print(f"  hit time_limit ({time_limit}s) before finding any solution -- inconclusive (nodes explored: {nodes})")
-        return
-
-    if found is True:
-        print(f"  found {len(solutions)} distinct solution(s), nodes explored: {nodes}")
-    elif interrupted:
-        print(f"  stopped by user -- showing {len(solutions)} of {max_solutions} distinct solution(s) found so far "
-              f"(nodes explored: {nodes})")
+    found, placements, nodes = pack_cluster(polygon, rects, required_adjacency,
+                                            interior_ids=interior_ids, time_limit=time_limit)
+    dt = time.perf_counter() - t0
+    status = "FEASIBLE" if found else "INFEASIBLE" if found is False else "INCONCLUSIVE"
+    print(f"\n  solve: {status}   nodes explored: {nodes}   time: {dt:.3f}s")
+    if found:
+        v = _verify(polygon, placements, rects, required_adjacency, interior_ids)
+        if v:
+            print(f"    overlaps={v[0]}  outside={v[1]}  wrong-adjacency pairs={v[2]}  interior rooms touching a wall={v[3]}")
+        save_path = f"layout_ex_{label}.png"
+        try:
+            render(polygon, placements, save_path, interior_ids, labels)
+            print(f"  saved to {save_path}")
+        except BaseException as exc:      # a broken / slow matplotlib must not hide the result
+            print(f"  (could not draw the picture: {type(exc).__name__}: {exc}; text picture instead)")
+            print("\n" + render_text(polygon, placements, interior_ids) + "\n")
+    elif found is False:
+        print("  no solution exists under these constraints")
     else:
-        print(f"  hit time_limit ({time_limit}s) before finishing -- showing {len(solutions)} of {max_solutions} "
-              f"distinct solution(s) found so far (nodes explored: {nodes})")
+        print(f"  hit time_limit ({time_limit}s) -- inconclusive")
+    return found, nodes, dt
 
-    poly_area = Polygon(polygon).area
-    for i, sol in enumerate(solutions, start=1):
-        overlaps, outside, holes = verify_placements(polygon, sol)
-        coverage = sum(w * h for _, _, w, h in sol.values()) / poly_area * 100
-        print(f"    solution {i}: coverage={coverage:.1f}%  overlaps={overlaps}  outside={outside}  holes={holes}")
 
-    save_path = f"packing_multi_solutions_ex_{label}.png"
-    render_solution_grid(polygon, solutions, save_path)
-    print(f"  saved to {save_path}")
+def run_example(choice, time_limit=60.0, required_adjacency=None):
+    """`required_adjacency=None` uses the example's own PTPG; pass an iterable (or []) to override."""
+    ex = EXAMPLES[choice]
+    adj = ex.get("required_adjacency") if required_adjacency is None else required_adjacency
+    return _solve_and_report(str(choice), ex["polygon"], ex["rects"], adj, time_limit,
+                             interior_ids=ex.get("interior", ()), labels=ex.get("labels"))[0]
+
+
+def select_diverse(layouts, k):
+    """Pick k layouts that differ from each other as much as possible (farthest-point choice). The distance of two
+    layouts is the sum over rooms of how far the room's corner moved plus any change of the room's shape (rotation)."""
+    if len(layouts) <= k:
+        return list(layouts)
+    def dist(p, q):
+        return sum(abs(p[i][0] - q[i][0]) + abs(p[i][1] - q[i][1]) + abs(p[i][2] - q[i][2]) + abs(p[i][3] - q[i][3])
+                   for i in p)
+    chosen = [0]
+    d = [dist(layouts[0], l) for l in layouts]
+    while len(chosen) < k:
+        nxt = max(range(len(layouts)), key=lambda i: d[i])
+        chosen.append(nxt)
+        d = [min(d[i], dist(layouts[nxt], layouts[i])) for i in range(len(layouts))]
+    return [layouts[i] for i in chosen]
+
+
+def _more_layouts(label, polygon, rects, adj, interior, labels=None):
+    raw = input("\nFind more layouts? Enter how many (up to 10, Enter = no): ").strip()
+    if not raw:
+        return
+    try:
+        n = int(raw)
+        if n < 1:
+            raise ValueError
+    except ValueError:
+        print(f"Invalid number: {raw!r}")
+        return
+    n = min(n, 10)
+    t0 = time.perf_counter()
+    pool, complete, nodes = find_layouts(polygon, rects, adj, interior_ids=interior, max_layouts=300,
+                                         time_limit=60.0, per_arrangement=1)
+    chosen = pick_diverse(pool, k=n)
+    dt = time.perf_counter() - t0
+    print(f"  collected {len(pool)} layouts in {dt:.1f}s ({nodes} nodes; "
+          + ("the search ran to the end" if complete else "stopped at the limit before the search ended")
+          + f"); {len(chosen)} clearly different ones chosen")
+    if not chosen:
+        return
+    titles = []
+    for k, lay in enumerate(chosen):
+        pcs, enc = unused_regions(polygon, lay)
+        titles.append(f"Layout {k + 1}: {pcs} unused piece" + ("" if pcs == 1 else "s") + (f" ({enc} closed in)" if enc else ""))
+    path = f"layouts_ex_{label}.png"
+    try:
+        render_many(polygon, chosen, path, interior, labels, titles)
+        print(f"  saved all {len(chosen)} in one picture: {path}")
+    except BaseException as exc:
+        print(f"  (could not draw {path}: {type(exc).__name__}: {exc})")
+
+
+
+def run_custom_example(time_limit=60.0):
+    import ast
+    print("\nEnter your own floorplan. Each value is a Python literal, e.g.:")
+    print("  polygon: [(0,0), (10,0), (10,10), (0,10)]")
+    print("  rects:   {0: (4,4), 1: (6,4), 2: (10,6)}")
+    print("  required_adjacency: [(0,1), (1,2)]   (or [] for none)")
+    print("  interior rects (touch no wall): [2]   (or [] for none)")
+    try:
+        polygon = ast.literal_eval(input("\npolygon: ").strip())
+        rects = {int(k): tuple(v) for k, v in ast.literal_eval(input("rects: ").strip()).items()}
+        raw = input("required_adjacency (blank for none): ").strip()
+        adj = ast.literal_eval(raw) if raw else []
+        raw = input("interior rects (blank for none): ").strip()
+        interior = ast.literal_eval(raw) if raw else []
+    except (ValueError, SyntaxError) as exc:
+        print(f"Could not parse that: {exc}")
+        return
+    found = _solve_and_report("custom", polygon, rects, adj, time_limit, interior_ids=interior)[0]
+    if found:
+        _more_layouts("custom", polygon, rects, adj, interior)
 
 
 def main():
     print("Available examples:")
     for key, ex in EXAMPLES.items():
-        n_adj = len(ex.get("required_adjacency") or [])
-        print(f"  {key}. {len(ex['rects'])} rects, {n_adj} adjacencies")
+        print(f"  {key}. {len(ex['rects'])} rects, {len(ex.get('required_adjacency') or [])} adjacencies")
+    print("  a. run all examples one by one")
     print("  c. enter your own custom example")
-
-    raw = input(f"\nChoose an example [{min(EXAMPLES)}-{max(EXAMPLES)}] or 'c': ").strip()
+    raw = input(f"\nChoose an example [{min(EXAMPLES)}-{max(EXAMPLES)}], 'a' for all or 'c': ").strip()
+    if raw.lower() == "a":
+        rows = []
+        for key, ex in EXAMPLES.items():
+            ex_ = ex
+            res = _solve_and_report(str(key), ex_["polygon"], ex_["rects"], ex_.get("required_adjacency"), 60.0,
+                                    interior_ids=ex_.get("interior", ()), labels=ex_.get("labels"))
+            rows.append((key, len(ex_["rects"]), *res))
+        print("\nSummary")
+        print("  ex  rooms  result        nodes     time")
+        for key, n, found, nodes, dt in rows:
+            st = "FEASIBLE" if found else "INFEASIBLE" if found is False else "INCONCLUSIVE"
+            print(f"  {key:>2}  {n:>5}  {st:<12} {nodes:>7}  {dt:7.2f}s")
+        print(f"  total time {sum(r[4] for r in rows):.1f}s")
+        return
     if raw.lower() == "c":
         run_custom_example()
         return
-
     try:
         choice = int(raw)
         if choice not in EXAMPLES:
@@ -1065,8 +1056,11 @@ def main():
     except ValueError:
         print(f"Invalid choice: {raw!r}")
         return
-
-    run_example(choice)
+    found = run_example(choice)
+    if found:
+        ex = EXAMPLES[choice]
+        _more_layouts(str(choice), ex["polygon"], ex["rects"], ex.get("required_adjacency"),
+                      ex.get("interior", ()), ex.get("labels"))
 
 
 if __name__ == "__main__":
