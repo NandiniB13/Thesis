@@ -44,6 +44,20 @@ def _lattice(polygon, sizes):
     return Fraction(g, den), den
 
 
+def _cut(iv, lo, hi):
+    """remove the inclusive range [lo, hi] from a sorted list of disjoint inclusive intervals"""
+    out = []
+    for a, b in iv:
+        if b < lo or a > hi:
+            out.append((a, b))
+        else:
+            if a < lo:
+                out.append((a, lo - 1))
+            if b > hi:
+                out.append((hi + 1, b))
+    return out
+
+
 class _Budget(Exception):
     pass
 
@@ -163,20 +177,66 @@ def _cluster_search(polygon, rects: Dict[int, tuple], required_adjacency=None, *
                 return 0                        # touching (shared wall of positive length) must equal "required"
         return Tof(T, r, i)
 
+    def _slide(lo, hi, f, fl, sl, ax):
+        """Offsets s in [lo, hi] along axis ax (0 = x, 1 = y) for a room whose extent on the other axis is
+        [f, f + fl) and whose length along ax is sl, such that against EVERY placed room q the pair rule
+        holds (no overlap; shared wall of positive length exactly when q is a required partner).
+        Returned as sorted disjoint inclusive intervals; no candidate that legal() would reject is built."""
+        iv = [(lo, hi)] if lo <= hi else []
+        for j, q in placed.items():
+            if not iv:
+                break
+            qs, ql = q[ax], q[2 + ax]
+            qf, qfl = q[1 - ax], q[3 - ax]
+            req = j in cur_partners
+            fo = f + fl > qf and qf + qfl > f             # f-ranges overlap
+            ft = f + fl == qf or qf + qfl == f            # f-ranges abut
+            if fo:
+                if req:                                   # must abut along the slide axis
+                    pts = (qs - sl, qs + ql)
+                    iv = [(max(a, p), min(b, p)) for a, b in iv for p in pts if a <= p <= b]
+                else:                                     # neither overlap nor abut
+                    iv = _cut(iv, qs - sl, qs + ql)
+            elif ft:
+                if req:                                   # must overlap along the slide axis
+                    iv = [(max(a, qs - sl + 1), min(b, qs + ql - 1)) for a, b in iv
+                          if max(a, qs - sl + 1) <= min(b, qs + ql - 1)]
+                else:
+                    iv = _cut(iv, qs - sl + 1, qs + ql - 1)
+            elif req:
+                return []                                 # cannot touch q from here
+        return iv
+
+    cur_partners = set()
+
     def candidates(i, aj):
+        """Every offset where room i satisfies the pair rule against all placed rooms, in sorted order.
+        Attached to a placed partner aj: slide along its four sides (intervals, not scans).
+        No placed partner: slide over the box allowed by the plot (cluster extent), minus forbidden bands."""
+        nonlocal cur_partners
+        cur_partners = partners[i]
+        cx0 = min(q[0] for q in placed.values()); cx1 = max(q[0] + q[2] for q in placed.values())
+        cy0 = min(q[1] for q in placed.values()); cy1 = max(q[1] + q[3] for q in placed.values())
         out = set()
-        if aj is not None:
-            px, py, pw, ph = placed[aj]
-            for (w, h) in orient[i]:
-                for yy in range(py - h + 1, py + ph):
-                    out.add((px + pw, yy, w, h)); out.add((px - w, yy, w, h))
-                for xx in range(px - w + 1, px + pw):
-                    out.add((xx, py + ph, w, h)); out.add((xx, py - h, w, h))
-        else:
-            for (w, h) in orient[i]:
-                for xx in range(-W, W + 1):
-                    for yy in range(-H, H + 1):
-                        out.add((xx, yy, w, h))
+        for (w, h) in orient[i]:
+            xlo, xhi = cx1 - W, cx0 + W - w                # room and cluster must both fit in the plot's width
+            ylo, yhi = cy1 - H, cy0 + H - h
+            if xlo > xhi or ylo > yhi:
+                continue
+            if aj is not None:
+                px, py, pw, ph = placed[aj]
+                for x in (px + pw, px - w):
+                    if xlo <= x <= xhi:
+                        for a, b in _slide(max(py - h + 1, ylo), min(py + ph - 1, yhi), x, w, h, 1):
+                            out.update((x, y, w, h) for y in range(a, b + 1))
+                for y in (py + ph, py - h):
+                    if ylo <= y <= yhi:
+                        for a, b in _slide(max(px - w + 1, xlo), min(px + pw - 1, xhi), y, h, w, 0):
+                            out.update((x, y, w, h) for x in range(a, b + 1))
+            else:
+                for x in range(xlo, xhi + 1):
+                    for a, b in _slide(ylo, yhi, x, w, h, 1):
+                        out.update((x, y, w, h) for y in range(a, b + 1))
         return sorted(out)
 
     def rec(T, prev=None, pr=None):
@@ -237,7 +297,7 @@ def _cluster_search(polygon, rects: Dict[int, tuple], required_adjacency=None, *
             else:
                 opts = []
                 for r in candidates(i, aj):
-                    T2 = legal(i, r, T)
+                    T2 = Tof(T, r, i)          # pair rule already guaranteed by candidates()
                     if T2:
                         opts.append((r, T2))
             if not opts:
@@ -741,7 +801,7 @@ EXAMPLES = {
         rects={1: (14, 13), 2: (12, 11), 3: (9, 10), 4: (5, 7), 5: (4, 6), 6: (11, 12), 7: (5, 8), 8: (13, 12)},
         required_adjacency=[(1, 2), (1, 3), (1, 4), (1, 7), (1, 8), (2, 3), (2, 5), (3, 4), (3, 5), (4, 5), (4, 6), (4, 8), (5, 6), (6, 8), (7, 8)],
         interior=[3, 4],
-    ),
+    )
 }
 
 
