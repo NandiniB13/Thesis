@@ -94,46 +94,44 @@ def _cluster_search(polygon, rects: Dict[int, tuple], required_adjacency=None, *
         if ax != bx and ay != by:
             raise ValueError("the plot must be rectilinear")
 
-    # ---- cells of the plot (stride W) -----------------------------------------------------------
-    inside = 0
+    # ---- cells of the plot (stride S) ----------------------------------------------------------
+    S = 2 * W + 1                               # stride of the translation grid (also used for the plot cells below)
+    inside = 0                                  # plot cells, row j at bit offset j*S; the W+1 padding bits stay 0
     for j in range(H):
         yc2 = 2 * j + 1
         cross = sorted(poly[k][0] for k in range(n)
                        if poly[k][0] == poly[(k + 1) % n][0]
                        and 2 * min(poly[k][1], poly[(k + 1) % n][1]) < yc2 < 2 * max(poly[k][1], poly[(k + 1) % n][1]))
-        for a in range(0, len(cross) - 1, 2):
-            for i in range(cross[a], cross[a + 1]):
-                inside |= 1 << (j * W + i)
+        for a in range(0, len(cross) - 1, 2):   # one mask per span instead of one bit per cell
+            inside |= ((1 << (cross[a + 1] - cross[a])) - 1) << (j * S + cross[a])
     if sum(size[i][0] * size[i][1] for i in ids) > bin(inside).count("1"):
         return False, None, 0
-    ones = [0] * (H + 3)
-    for h in range(1, H + 3):
-        ones[h] = ones[h - 1] | (1 << (W * (h - 1)))
-    rmask = lambda x, y, w, h: (((1 << w) - 1) * ones[h]) << (y * W + x)
 
     # ---- translation masks ------------------------------------------------------------------------
-    S = 2 * W + 1                               # stride of the translation grid; u = plot position of the seed room,
-    full = 0                                    # so only ux in [0, W), uy in [0, H) matter (columns >= W absorb the wrap)
-    for uy in range(H):
+    full = 0                                    # u = plot position of the seed room, so only ux in [0, W), uy in [0, H)
+    for uy in range(H):                         # matter (columns >= W absorb the wrap)
         full |= ((1 << W) - 1) << (uy * S)
     Vcache = {}
+
+    def erode(m, k, step):
+        """bit p of the result is set iff bits p, p+step, ..., p+(k-1)*step of m are all set (log k shifts).
+        Row padding and the zeros above the last row make runs that leave the plot fail by themselves."""
+        res, run = m, 1
+        while run * 2 <= k:
+            res &= res >> (run * step)
+            run *= 2
+        if run < k:
+            res &= res >> ((k - run) * step)
+        return res
 
     def V(w, h, inner):
         """bit (a + b*S) set when a w x h room at (a, b) of the plot is allowed (inner: strictly inside)"""
         key = (w, h, inner)
         if key not in Vcache:
-            m = 0
-            for b in range(H - h + 1):
-                for a in range(W - w + 1):
-                    if inner:
-                        if a < 1 or b < 1 or a + w + 1 > W or b + h + 1 > H:
-                            continue
-                        r = rmask(a - 1, b - 1, w + 2, h + 2)
-                    else:
-                        r = rmask(a, b, w, h)
-                    if inside & r == r:
-                        m |= 1 << (a + b * S)
-            Vcache[key] = m
+            if inner:       # the room plus a 1-unit margin all round must fit; move the result from (a-1, b-1) to (a, b)
+                Vcache[key] = erode(erode(inside, w + 2, 1), h + 2, S) << (S + 1)
+            else:
+                Vcache[key] = erode(erode(inside, w, 1), h, S)
         return Vcache[key]
 
     def Tof(T, r, i):
@@ -208,6 +206,7 @@ def _cluster_search(polygon, rects: Dict[int, tuple], required_adjacency=None, *
         return iv
 
     cur_partners = set()
+    npl = {i: 0 for i in ids}                   # npl[i] = number of placed required partners of i (kept up to date)
 
     def candidates(i, aj):
         """Every offset where room i satisfies the pair rule against all placed rooms, in sorted order.
@@ -268,7 +267,7 @@ def _cluster_search(polygon, rects: Dict[int, tuple], required_adjacency=None, *
                 if on_solution(lay):
                     raise _Budget
             return 0
-        front = [i for i in rest if any(j in placed for j in partners[i])]
+        front = [i for i in rest if npl[i]]
         pool = front if front else [max(rest, key=lambda i: size[i][0] * size[i][1])]
         # next room: every room touching the cluster is checked, and one with no legal position cuts the branch
         cand_list = []
@@ -285,6 +284,12 @@ def _cluster_search(polygon, rects: Dict[int, tuple], required_adjacency=None, *
                     rx, ry, rw, rh = r
                     rx2 = rx + rw
                     ry2 = ry + rh
+                    if rx2 < qx or qx2 < rx or ry2 < qy or qy2 < ry:     # strictly apart: no overlap, no touch
+                        if not pin:
+                            T3 = T2 & T
+                            if T3:
+                                opts.append((r, T3))
+                        continue
                     ox = rx2 > qx and qx2 > rx
                     oy = ry2 > qy and qy2 > ry
                     if ox and oy:
@@ -312,9 +317,13 @@ def _cluster_search(polygon, rects: Dict[int, tuple], required_adjacency=None, *
         child_prev = {k: (a, o) for (k, o, a) in cand_list if k != i}
         for r, T2 in opts:
             placed[i] = r
+            for j in partners[i]:
+                npl[j] += 1
             res = rec(T2, child_prev, (i, r))
             if res:
                 return res
+            for j in partners[i]:
+                npl[j] -= 1
             del placed[i]
         return 0
 
@@ -328,9 +337,13 @@ def _cluster_search(polygon, rects: Dict[int, tuple], required_adjacency=None, *
             if not T:
                 continue
             placed[first] = r
+            for j in partners[first]:
+                npl[j] += 1
             final = rec(T)
             if final:
                 break
+            for j in partners[first]:
+                npl[j] -= 1
             del placed[first]
     except _Timeout:
         return None, None, nodes[0]
@@ -801,7 +814,79 @@ EXAMPLES = {
         rects={1: (14, 13), 2: (12, 11), 3: (9, 10), 4: (5, 7), 5: (4, 6), 6: (11, 12), 7: (5, 8), 8: (13, 12)},
         required_adjacency=[(1, 2), (1, 3), (1, 4), (1, 7), (1, 8), (2, 3), (2, 5), (3, 4), (3, 5), (4, 5), (4, 6), (4, 8), (5, 6), (6, 8), (7, 8)],
         interior=[3, 4],
-    )
+    ),
+    49: dict(   # U-shaped plot (2 reflex corners): 14 rooms, 22 pairs, hub-and-ring layout built by dissecting the plot (generator seed 411)
+        polygon=[(0, 0), (60, 0), (60, 56), (40, 56), (40, 26), (20, 26), (20, 56), (0, 56)],
+        rects={1: (11, 26), 2: (10, 26), 3: (12, 20), 4: (8, 19), 5: (5, 26), 6: (12, 6), 7: (14, 14), 8: (14, 8), 9: (20, 5), 10: (20, 9), 11: (15, 16), 12: (20, 9), 13: (15, 15), 14: (5, 15)},
+        required_adjacency=[(1, 3), (1, 6), (1, 7), (1, 8), (1, 9), (2, 4), (2, 7), (2, 8), (2, 13), (3, 5), (3, 6), (3, 9), (4, 13), (4, 14), (5, 6), (5, 9), (8, 13), (9, 10), (10, 11), (12, 13), (12, 14), (13, 14)],
+        interior=[3],
+    ),
+    50: dict(   # T-shaped plot (2 reflex corners): 12 rooms, 19 pairs, hub-and-ring layout built by dissecting the plot (generator seed 1908)
+        polygon=[(0, 36), (22, 36), (22, 0), (46, 0), (46, 36), (68, 36), (68, 60), (0, 60)],
+        rects={1: (7, 36), 2: (5, 33), 3: (12, 20), 4: (8, 9), 5: (31, 18), 6: (7, 24), 7: (6, 24), 8: (6, 24), 9: (18, 7), 10: (18, 7), 11: (18, 5), 12: (18, 5)},
+        required_adjacency=[(1, 2), (1, 3), (1, 6), (3, 4), (4, 6), (4, 8), (5, 6), (6, 8), (7, 9), (7, 10), (7, 11), (7, 12), (8, 9), (8, 10), (8, 11), (8, 12), (9, 10), (9, 12), (11, 12)],
+        interior=[9, 12],
+    ),
+    51: dict(   # S-shaped plot (2 reflex corners): 15 rooms, 23 pairs, hub-and-ring layout built by dissecting the plot (generator seed 3681)
+        polygon=[(0, 0), (50, 0), (50, 26), (76, 26), (76, 70), (26, 70), (26, 44), (0, 44)],
+        rects={1: (26, 8), 2: (24, 13), 3: (26, 10), 4: (9, 13), 5: (15, 8), 6: (5, 14), 7: (21, 18), 8: (15, 27), 9: (24, 15), 10: (26, 12), 11: (11, 27), 12: (5, 29), 13: (26, 5), 14: (19, 7), 15: (16, 18)},
+        required_adjacency=[(1, 5), (2, 3), (2, 4), (2, 7), (3, 7), (3, 13), (4, 5), (6, 7), (7, 10), (7, 11), (7, 13), (8, 9), (8, 10), (8, 11), (8, 12), (9, 12), (10, 11), (10, 12), (10, 13), (12, 13), (12, 14), (12, 15), (14, 15)],
+        interior=[10],
+    ),
+    52: dict(   # staircase plot (2 reflex corners): 15 rooms, 25 pairs, hub-and-ring layout built by dissecting the plot (generator seed 755)
+        polygon=[(0, 0), (72, 0), (72, 20), (54, 20), (54, 38), (36, 38), (36, 56), (0, 56)],
+        rects={1: (5, 29), 2: (14, 5), 3: (11, 9), 4: (19, 5), 5: (17, 5), 6: (5, 13), 7: (6, 9), 8: (5, 9), 9: (31, 7), 10: (24, 35), 11: (12, 14), 12: (18, 13), 13: (18, 11), 14: (18, 6), 15: (18, 14)},
+        required_adjacency=[(1, 5), (1, 6), (1, 9), (1, 13), (2, 3), (2, 4), (3, 4), (3, 5), (3, 8), (4, 5), (4, 9), (5, 7), (5, 8), (5, 9), (5, 12), (5, 13), (7, 8), (7, 12), (9, 10), (11, 13), (12, 13), (12, 14), (12, 15), (13, 15), (14, 15)],
+        interior=[5],
+    ),
+    53: dict(   # plus-shaped plot (4 reflex corners): 14 rooms, 24 pairs, hub-and-ring layout built by dissecting the plot (generator seed 1075)
+        polygon=[(22, 0), (46, 0), (46, 22), (68, 22), (68, 46), (46, 46), (46, 68), (22, 68), (22, 46), (0, 46), (0, 22), (22, 22)],
+        rects={1: (22, 15), 2: (15, 18), 3: (9, 23), 4: (24, 8), 5: (9, 19), 6: (15, 5), 7: (10, 14), 8: (15, 5), 9: (22, 10), 10: (9, 12), 11: (9, 14), 12: (5, 19), 13: (17, 12), 14: (17, 12)},
+        required_adjacency=[(1, 3), (1, 6), (2, 3), (2, 4), (2, 6), (2, 9), (2, 11), (3, 4), (3, 6), (3, 13), (3, 14), (4, 5), (4, 7), (4, 9), (4, 14), (5, 8), (6, 11), (7, 8), (9, 10), (9, 11), (10, 11), (12, 13), (12, 14), (13, 14)],
+        interior=[2],
+    ),
+    54: dict(   # staircase plot (2 reflex corners): 12 rooms, 19 pairs, hub-and-ring layout built by dissecting the plot (generator seed 4042)
+        polygon=[(0, 0), (72, 0), (72, 20), (54, 20), (54, 38), (36, 38), (36, 56), (0, 56)],
+        rects={1: (36, 41), 2: (17, 7), 3: (13, 8), 4: (14, 7), 5: (7, 8), 6: (5, 7), 7: (6, 8), 8: (10, 8), 9: (18, 20), 10: (9, 11), 11: (5, 9), 12: (14, 16)},
+        required_adjacency=[(1, 3), (1, 5), (1, 7), (1, 8), (1, 9), (1, 10), (2, 3), (2, 4), (2, 5), (2, 6), (2, 7), (3, 5), (3, 7), (4, 7), (4, 8), (5, 6), (7, 8), (9, 12), (11, 12)],
+        interior=[3, 7],
+    ),
+    55: dict(   # H-shaped plot (4 reflex corners): 14 rooms, 28 pairs, 2-connected, fill 0.79, hub-and-ring layout (generator seed 8063)
+        polygon=[(0, 0), (22, 0), (22, 24), (44, 24), (44, 0), (66, 0), (66, 64), (44, 64), (44, 40), (22, 40), (22, 64), (0, 64)],
+        rects={1: (9, 25), 2: (9, 14), 3: (9, 12), 4: (13, 26), 5: (13, 10), 6: (22, 9), 7: (22, 7), 8: (10, 22), 9: (6, 34), 10: (6, 34), 11: (8, 25), 12: (10, 12), 13: (8, 5), 14: (14, 17)},
+        required_adjacency=[(1, 3), (1, 4), (1, 6), (2, 3), (2, 5), (2, 7), (3, 4), (3, 5), (3, 6), (3, 7), (4, 5), (6, 7), (6, 10), (6, 11), (6, 13), (7, 10), (8, 9), (8, 10), (8, 12), (8, 13), (8, 14), (9, 12), (9, 14), (10, 12), (10, 13), (11, 13), (11, 14), (13, 14)],
+        interior=[3, 8, 13],
+    ),
+    56: dict(   # S-shaped plot (2 reflex corners): 13 rooms, 25 pairs, 2-connected, fill 0.68, hub-and-ring layout (generator seed 348)
+        polygon=[(0, 0), (50, 0), (50, 26), (76, 26), (76, 70), (26, 70), (26, 44), (0, 44)],
+        rects={1: (18, 15), 2: (18, 11), 3: (5, 26), 4: (11, 10), 5: (11, 16), 6: (19, 18), 7: (7, 18), 8: (15, 14), 9: (18, 17), 10: (19, 16), 11: (19, 10), 12: (31, 5), 13: (31, 6)},
+        required_adjacency=[(1, 2), (1, 5), (1, 9), (1, 10), (2, 4), (2, 5), (3, 4), (3, 5), (3, 6), (3, 7), (4, 5), (5, 7), (5, 10), (6, 7), (7, 10), (7, 11), (8, 11), (8, 13), (9, 10), (9, 11), (9, 12), (10, 11), (11, 12), (11, 13), (12, 13)],
+        interior=[5, 10],
+    ),
+    57: dict(   # T-shaped plot (2 reflex corners): 13 rooms, 24 pairs, 2-connected, fill 0.80, hub-and-ring layout (generator seed 2119)
+        polygon=[(0, 36), (22, 36), (22, 0), (46, 0), (46, 36), (68, 36), (68, 60), (0, 60)],
+        rects={1: (10, 30), 2: (14, 10), 3: (15, 16), 4: (26, 8), 5: (40, 5), 6: (22, 8), 7: (15, 11), 8: (10, 7), 9: (11, 11), 10: (13, 8), 11: (7, 8), 12: (13, 11), 13: (13, 5)},
+        required_adjacency=[(1, 2), (1, 7), (1, 9), (2, 7), (2, 12), (3, 6), (3, 11), (3, 12), (3, 13), (4, 5), (4, 10), (5, 6), (5, 7), (5, 8), (5, 9), (5, 10), (5, 13), (6, 10), (6, 11), (6, 13), (7, 9), (7, 12), (8, 9), (12, 13)],
+        interior=[7, 13],
+    ),
+    58: dict(   # U-shaped plot (2 reflex corners): 10 rooms, 19 pairs, 2-connected, fill 0.74, hub-and-ring layout (generator seed 6276)
+        polygon=[(0, 0), (60, 0), (60, 56), (40, 56), (40, 26), (20, 26), (20, 56), (0, 56)],
+        rects={1: (34, 26), 2: (9, 14), 3: (6, 20), 4: (9, 12), 5: (5, 21), 6: (11, 5), 7: (6, 6), 8: (6, 14), 9: (6, 7), 10: (20, 24)},
+        required_adjacency=[(1, 2), (1, 4), (2, 4), (2, 5), (3, 7), (3, 8), (3, 9), (4, 5), (4, 6), (4, 10), (5, 6), (5, 8), (5, 9), (6, 7), (6, 9), (6, 10), (7, 9), (7, 10), (8, 9)],
+        interior=[6, 9],
+    ),
+    59: dict(   # plus-shaped plot (4 reflex corners): 13 rooms, 25 pairs, 2-connected, fill 0.79, hub-and-ring layout (generator seed 346)
+        polygon=[(22, 0), (46, 0), (46, 22), (68, 22), (68, 46), (46, 46), (46, 68), (22, 68), (22, 46), (0, 46), (0, 22), (22, 22)],
+        rects={1: (21, 16), 2: (14, 15), 3: (14, 13), 4: (14, 10), 5: (10, 12), 6: (10, 11), 7: (17, 9), 8: (7, 9), 9: (22, 5), 10: (6, 15), 11: (16, 19), 12: (20, 6), 13: (10, 18)},
+        required_adjacency=[(1, 7), (1, 8), (2, 4), (2, 6), (3, 4), (3, 5), (3, 6), (3, 7), (3, 11), (4, 6), (4, 11), (5, 6), (5, 7), (5, 8), (5, 13), (6, 13), (7, 8), (7, 9), (7, 11), (8, 12), (8, 13), (9, 10), (9, 11), (10, 11), (12, 13)],
+        interior=[3, 5],
+    ),
+    60: dict(   # staircase plot (2 reflex corners): 13 rooms, 25 pairs, 2-connected, fill 0.74, hub-and-ring layout (generator seed 187)
+        polygon=[(0, 0), (72, 0), (72, 20), (54, 20), (54, 38), (36, 38), (36, 56), (0, 56)],
+        rects={1: (30, 9), 2: (30, 8), 3: (30, 7), 4: (21, 10), 5: (6, 31), 6: (6, 16), 7: (9, 10), 8: (6, 9), 9: (30, 10), 10: (18, 14), 11: (18, 10), 12: (7, 14), 13: (5, 14)},
+        required_adjacency=[(1, 3), (1, 6), (1, 8), (2, 3), (2, 4), (2, 5), (2, 6), (2, 7), (3, 6), (4, 7), (4, 9), (5, 6), (5, 7), (5, 9), (5, 10), (6, 8), (6, 10), (6, 11), (6, 12), (7, 9), (8, 12), (10, 11), (11, 12), (11, 13), (12, 13)],
+        interior=[6, 7],
+    ),
 }
 
 
